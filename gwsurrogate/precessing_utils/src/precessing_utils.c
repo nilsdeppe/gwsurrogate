@@ -57,6 +57,7 @@ static struct module_state _state;
 
 /* Forward declarations */
 static PyObject *py_rotate_waveform(PyObject *self, PyObject *args);
+static PyObject *eval_coorb_modes(PyObject *self, PyObject *args);
 
 /* ==== Setup the python methods table === */
 static PyMethodDef _utils_methods[] = {
@@ -71,6 +72,7 @@ static PyMethodDef _utils_methods[] = {
     {"wigner_coef", wigner_coef, METH_VARARGS},
     {"wignerD_matrices", py_wignerD_matrices, METH_VARARGS},
     {"rotate_waveform", py_rotate_waveform, METH_VARARGS},
+    {"eval_coorb_modes", eval_coorb_modes, METH_VARARGS},
     {NULL, NULL} /* Marks the end of this structure */
 };
 
@@ -1542,6 +1544,226 @@ PyObject *py_wignerD_matrices(PyObject *self, PyObject *args)
 
     Py_RETURN_NONE;
 }
+
+
+/* ------------------------------------------------------------------ */
+/* eval_coorb_modes: fused __call__ + _eval_comp for                  */
+/*   CoorbitalWaveformSurrogate                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Evaluates all coorbital waveform mode components and assembles complex modes.
+ * Replaces the Python __call__ + _eval_comp loops with a single C call.
+ *
+ * Arguments:
+ *   q:                  double, mass ratio
+ *   chiA:               (N, 3) float64, spin A time series
+ *   chiB:               (N, 3) float64, spin B time series
+ *   comp_n_nodes:       (n_comps,) int32, number of nodes per component
+ *   comp_node_offset:   (n_comps,) int32, offset into flat node arrays
+ *   all_node_indices:   (total_nodes,) int32, concatenated nodeIndices
+ *   node_n_coefs:       (total_nodes,) int32, number of coefs per node
+ *   node_coef_offset:   (total_nodes,) int32, offset into coefs/orders
+ *   all_coefs:          (total_coefs,) float64, concatenated coefficients
+ *   all_orders:         (total_coefs, 7) int32, concatenated bf orders
+ *   all_EI_basis:       (total_nodes, N_time) float64, stacked EI bases
+ *   mode_info:          (n_groups, 8) int32, mode assembly metadata
+ *   q_consts:           (5,) float64, q-dependent constants
+ *   nmodes:             int, number of output modes
+ *   ellMax:             int, max ell to include
+ *   fit_params_mode:    int, 0=NRSur7dq4, 1=identity
+ *   q_fit_offset:       double
+ *   q_fit_slope:        double
+ *   q_max_bfOrder:      int
+ *   chi_max_bfOrder:    int
+ *
+ * Returns (nmodes, N_time) complex128 array.
+ */
+static PyObject *eval_coorb_modes(PyObject *self, PyObject *args) {
+
+    double q_val;
+    PyArrayObject *chiA_arr, *chiB_arr;
+    PyArrayObject *comp_n_nodes_arr, *comp_node_offset_arr;
+    PyArrayObject *all_node_indices_arr, *node_n_coefs_arr, *node_coef_offset_arr;
+    PyArrayObject *all_coefs_arr, *all_orders_arr, *all_EI_basis_arr;
+    PyArrayObject *mode_info_arr, *q_consts_arr;
+    int nmodes, ellMax_eval, fit_params_mode;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+
+    if (!PyArg_ParseTuple(args, "dO!O!O!O!O!O!O!O!O!O!O!O!iiiddii",
+            &q_val,
+            &PyArray_Type, &chiA_arr,
+            &PyArray_Type, &chiB_arr,
+            &PyArray_Type, &comp_n_nodes_arr,
+            &PyArray_Type, &comp_node_offset_arr,
+            &PyArray_Type, &all_node_indices_arr,
+            &PyArray_Type, &node_n_coefs_arr,
+            &PyArray_Type, &node_coef_offset_arr,
+            &PyArray_Type, &all_coefs_arr,
+            &PyArray_Type, &all_orders_arr,
+            &PyArray_Type, &all_EI_basis_arr,
+            &PyArray_Type, &mode_info_arr,
+            &PyArray_Type, &q_consts_arr,
+            &nmodes, &ellMax_eval, &fit_params_mode,
+            &q_fit_offset, &q_fit_slope,
+            &q_max_bfOrder, &chi_max_bfOrder)) return NULL;
+
+    /* Extract data pointers */
+    double *chiA = (double *)PyArray_DATA(chiA_arr);
+    double *chiB = (double *)PyArray_DATA(chiB_arr);
+    npy_int32 *comp_n_nodes = (npy_int32 *)PyArray_DATA(comp_n_nodes_arr);
+    npy_int32 *comp_node_offset = (npy_int32 *)PyArray_DATA(comp_node_offset_arr);
+    npy_int32 *all_node_indices = (npy_int32 *)PyArray_DATA(all_node_indices_arr);
+    npy_int32 *node_n_coefs = (npy_int32 *)PyArray_DATA(node_n_coefs_arr);
+    npy_int32 *node_coef_offset = (npy_int32 *)PyArray_DATA(node_coef_offset_arr);
+    double *all_coefs = (double *)PyArray_DATA(all_coefs_arr);
+    npy_int32 *all_orders = (npy_int32 *)PyArray_DATA(all_orders_arr);
+    double *all_EI_basis = (double *)PyArray_DATA(all_EI_basis_arr);
+    npy_int32 *mode_info = (npy_int32 *)PyArray_DATA(mode_info_arr);
+    double *q_consts = (double *)PyArray_DATA(q_consts_arr);
+
+    int n_comps = (int)PyArray_DIMS(comp_n_nodes_arr)[0];
+    int n_groups = (int)PyArray_DIMS(mode_info_arr)[0];
+    int N_time = (int)PyArray_DIMS(all_EI_basis_arr)[1];
+
+    /* Pre-compute q-dependent powers (same for all nodes) */
+    double q_transformed = (fit_params_mode == 0) ? q_consts[0] : q_val;
+    double q_powers[16];  /* q_max_bfOrder <= 15 */
+    for (int i = 0; i <= q_max_bfOrder; i++) {
+        q_powers[i] = ipow(q_fit_offset + q_fit_slope * q_transformed, i);
+    }
+
+    /* Allocate output: (nmodes, N_time) complex128, zero-initialized */
+    npy_intp out_dims[2] = {nmodes, N_time};
+    PyArrayObject *modes_arr = (PyArrayObject *)PyArray_ZEROS(
+            2, out_dims, NPY_COMPLEX128, 0);
+    if (!modes_arr) return NULL;
+    double *modes = (double *)PyArray_DATA(modes_arr);
+
+    /* Allocate workspace for component results */
+    double *comp_results = (double *)malloc(
+            (size_t)n_comps * (size_t)N_time * sizeof(double));
+    if (!comp_results) {
+        Py_DECREF(modes_arr);
+        return PyErr_NoMemory();
+    }
+
+    int chi_pw_size = 6 * (chi_max_bfOrder + 1);
+
+    /* ---- Phase 1: Evaluate all components ---- */
+    for (int c = 0; c < n_comps; c++) {
+        int nn = comp_n_nodes[c];
+        int offset = comp_node_offset[c];
+        double nodes_buf[128];  /* max nodes per component */
+
+        for (int j = 0; j < nn; j++) {
+            int gj = offset + j;
+            int ni = all_node_indices[gj];
+
+            /* Build x[7] from q, chiA[ni], chiB[ni] */
+            double x[7];
+            x[0] = q_val;
+            x[1] = chiA[ni * 3 + 0];
+            x[2] = chiA[ni * 3 + 1];
+            x[3] = chiA[ni * 3 + 2];
+            x[4] = chiB[ni * 3 + 0];
+            x[5] = chiB[ni * 3 + 1];
+            x[6] = chiB[ni * 3 + 2];
+
+            /* Apply fit_params transform */
+            if (fit_params_mode == 0) {
+                /* NRSur7dq4: x[0]=log(q), x[3]=chiHat, x[6]=chi_a */
+                double chi1z = x[3], chi2z = x[6];
+                x[0] = q_consts[0];  /* log(q) */
+                double chi_wtAvg = q_consts[1]*chi1z + q_consts[2]*chi2z;
+                x[3] = (chi_wtAvg - q_consts[3]*(chi1z + chi2z))
+                        / q_consts[4];
+                x[6] = (chi1z - chi2z) * 0.5;
+            }
+            /* mode == 1: identity, x unchanged */
+
+            /* Compute chi_powers (q_powers already done) */
+            double chi_powers[42];  /* 6*(max_bfOrder+1), max ~6*7=42 */
+            for (int p = 0; p <= chi_max_bfOrder; p++) {
+                for (int k = 0; k < 6; k++) {
+                    chi_powers[k * (chi_max_bfOrder + 1) + p] =
+                            ipow(x[k + 1], p);
+                }
+            }
+
+            /* Evaluate polynomial */
+            int nc = node_n_coefs[gj];
+            int co = node_coef_offset[gj];
+            double res = 0.0;
+            for (int i = 0; i < nc; i++) {
+                npy_int32 *ord = all_orders + (co + i) * 7;
+                double prod = q_powers[ord[0]];
+                for (int k = 0; k < 6; k++) {
+                    prod *= chi_powers[k*(chi_max_bfOrder+1) + ord[k+1]];
+                }
+                res += all_coefs[co + i] * prod;
+            }
+            nodes_buf[j] = res;
+        }
+
+        /* Dot product: comp_results[c] = nodes . EI_basis */
+        double *out = comp_results + (size_t)c * N_time;
+        memset(out, 0, (size_t)N_time * sizeof(double));
+        for (int j = 0; j < nn; j++) {
+            double nj = nodes_buf[j];
+            double *basis = all_EI_basis + (size_t)(offset + j) * N_time;
+            for (int t = 0; t < N_time; t++) {
+                out[t] += nj * basis[t];
+            }
+        }
+    }
+
+    /* ---- Phase 2: Assemble complex modes ---- */
+    for (int g = 0; g < n_groups; g++) {
+        npy_int32 *info = mode_info + g * 8;
+        int ell = info[0];
+        int m   = info[1];
+
+        if (ell > ellMax_eval) continue;
+
+        if (m == 0) {
+            int mode_idx = info[2];
+            int comp_re  = info[3];
+            int comp_im  = info[4];
+            double *re = comp_results + (size_t)comp_re * N_time;
+            double *im = comp_results + (size_t)comp_im * N_time;
+            double *dst = modes + (size_t)mode_idx * N_time * 2;
+            for (int t = 0; t < N_time; t++) {
+                dst[t * 2]     = re[t];
+                dst[t * 2 + 1] = im[t];
+            }
+        } else {
+            int idx_pos  = info[2];
+            int idx_neg  = info[3];
+            int comp_rep = info[4];
+            int comp_rem = info[5];
+            int comp_imp = info[6];
+            int comp_imm = info[7];
+            double *rep = comp_results + (size_t)comp_rep * N_time;
+            double *rem_d = comp_results + (size_t)comp_rem * N_time;
+            double *imp = comp_results + (size_t)comp_imp * N_time;
+            double *imm = comp_results + (size_t)comp_imm * N_time;
+            double *pos = modes + (size_t)idx_pos * N_time * 2;
+            double *neg = modes + (size_t)idx_neg * N_time * 2;
+            for (int t = 0; t < N_time; t++) {
+                pos[t * 2]     = rep[t] - rem_d[t];
+                pos[t * 2 + 1] = imm[t] - imp[t];
+                neg[t * 2]     = rep[t] + rem_d[t];
+                neg[t * 2 + 1] = imp[t] + imm[t];
+            }
+        }
+    }
+
+    free(comp_results);
+    return PyArray_Return(modes_arr);
+}
+
 
 /* ------------------------------------------------------------------ */
 /* rotate_waveform: quaternion inverse + wignerD + fused matmul in C  */

@@ -3,8 +3,10 @@ Unit tests for precessing surrogate utility functions:
   - normalize_spin
   - splinterp_many  (batch spline interpolation)
   - _splinterp_Cwrapper / _splinterp_Cwrapper_many (low-level wrappers)
+  - eval_coorb_modes (C vs Python path comparison)
 """
 
+import os
 import numpy as np
 import pytest
 
@@ -13,6 +15,108 @@ from gwsurrogate.new.surrogate import _splinterp_Cwrapper, _splinterp_Cwrapper_m
 
 
 RNG = np.random.default_rng(99)
+
+
+# ---------------------------------------------------------------------------
+# Skip condition for tests requiring the NRSur7dq4 model
+# ---------------------------------------------------------------------------
+
+def _model_path():
+    import gwsurrogate as gws
+    candidate = os.path.join(
+        os.path.dirname(gws.__file__),
+        "surrogate_downloads",
+        "NRSur7dq4.h5",
+    )
+    return candidate if os.path.isfile(candidate) else None
+
+
+_MODEL_AVAILABLE = _model_path() is not None
+
+skip_if_no_model = pytest.mark.skipif(
+    not _MODEL_AVAILABLE,
+    reason="NRSur7dq4.h5 not found",
+)
+
+
+@pytest.fixture(scope="module")
+def coorb_test_data():
+    """Load NRSur7dq4, run dynamics, return coorb_sur and test inputs."""
+    import warnings
+    import gwsurrogate as gws
+
+    sur = gws.LoadSurrogate("NRSur7dq4")
+    psur = sur._sur_dimless
+
+    q = 2.0
+    chiA0 = np.array([0.0, 0.0, 0.5])
+    chiB0 = np.array([0.0, 0.0, -0.3])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        quat, orbphase, chiA_copr, chiB_copr = \
+            psur.get_dynamics(q, chiA0, chiB0)
+
+    from gwsurrogate.new.precessing_surrogate import coorb_spins_from_copr_spins
+    from gwsurrogate.new.surrogate import _splinterp_Cwrapper_many
+
+    # Interpolate to coorbital time grid
+    t_ds = psur.dynamics_sur.t
+    t_coorb = psur.coorb_sur.t
+    chiA_copr_coorb = _splinterp_Cwrapper_many(
+        t_coorb, t_ds, chiA_copr.T).T
+    chiB_copr_coorb = _splinterp_Cwrapper_many(
+        t_coorb, t_ds, chiB_copr.T).T
+    orbphase_coorb = _splinterp_Cwrapper_many(
+        t_coorb, t_ds, orbphase[np.newaxis, :])[0]
+
+    chiA_coorb, chiB_coorb = coorb_spins_from_copr_spins(
+        chiA_copr_coorb, chiB_copr_coorb, orbphase_coorb)
+
+    return psur.coorb_sur, q, chiA_coorb, chiB_coorb
+
+
+@skip_if_no_model
+def test_eval_coorb_modes_c_vs_python(coorb_test_data):
+    """C eval_coorb_modes matches Python _call_python for NRSur7dq4."""
+    coorb_sur, q, chiA, chiB = coorb_test_data
+    ellMax = coorb_sur.ellMax  # 4
+
+    modes_c = coorb_sur._call_c(q, chiA, chiB, ellMax)
+    modes_py = coorb_sur._call_python(q, chiA, chiB, ellMax)
+
+    np.testing.assert_allclose(modes_c, modes_py, rtol=1e-12, atol=1e-15,
+                               err_msg="C and Python coorb modes disagree")
+
+
+@skip_if_no_model
+def test_eval_coorb_modes_partial_ellmax(coorb_test_data):
+    """C path with ellMax=2 matches Python path."""
+    coorb_sur, q, chiA, chiB = coorb_test_data
+    ellMax = 2
+
+    modes_c = coorb_sur._call_c(q, chiA, chiB, ellMax)
+    modes_py = coorb_sur._call_python(q, chiA, chiB, ellMax)
+
+    np.testing.assert_allclose(modes_c, modes_py, rtol=1e-12, atol=1e-15,
+                               err_msg="Partial ellMax: C vs Python disagree")
+
+
+@skip_if_no_model
+def test_eval_coorb_modes_missing_modes_zero(coorb_test_data):
+    """Modes not in mode_list should remain zero."""
+    coorb_sur, q, chiA, chiB = coorb_test_data
+    ellMax = coorb_sur.ellMax
+    modes = coorb_sur._call_c(q, chiA, chiB, ellMax)
+
+    # Check that modes at indices not corresponding to any mode_list entry
+    # are zero (comparing with Python which also zeros them)
+    modes_py = coorb_sur._call_python(q, chiA, chiB, ellMax)
+    # Both should have the same zero pattern
+    zero_mask_py = np.all(modes_py == 0, axis=1)
+    zero_mask_c = np.all(modes == 0, axis=1)
+    np.testing.assert_array_equal(zero_mask_c, zero_mask_py,
+                                  err_msg="Zero mode patterns differ")
 
 
 # ---------------------------------------------------------------------------
