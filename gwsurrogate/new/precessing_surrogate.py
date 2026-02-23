@@ -884,8 +884,7 @@ def mode_sum(h_modes, ellMax, theta, phi):
 
 def normalize_spin(chi, chi_norm):
     if chi_norm > 0.:
-        tmp_norm = np.sqrt(np.sum(chi**2, 1))
-        return (chi.T * chi_norm / tmp_norm).T
+        chi *= chi_norm / np.linalg.norm(chi, axis=1, keepdims=True)
     return chi
 
 ##############################################################################
