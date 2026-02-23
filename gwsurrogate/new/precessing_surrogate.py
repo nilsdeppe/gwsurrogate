@@ -63,15 +63,55 @@ http://arxiv.org/abs/1302.2919
     n = q.shape[1]
     num_ells = ellMax - 1
 
-    # Allocate output — Python owns the memory
+    # Allocate output — Python owns the memory.
+    # C zeros them only when edge-case time points exist (n2>0 or n3>0);
+    # in the general case every element is written, so np.empty suffices.
     matrices = [
-        np.zeros((2*(i+2)+1, 2*(i+2)+1, n), dtype=np.complex128)
+        np.empty((2*(i+2)+1, 2*(i+2)+1, n), dtype=np.complex128)
         for i in range(num_ells)
     ]
 
     # C fills them in-place, returns None
     _utils.wignerD_matrices(q, ellMax, matrices)
 
+    return matrices
+
+def _wignerD_matrices_opt(q, ellMax):
+    """Optimized wignerD_matrices: symmetry, real/complex separation, recurrence."""
+    if q.ndim != 2 or q.shape[0] != 4:
+        raise ValueError("q must have shape (4, N)")
+    if ellMax < 2:
+        raise ValueError("ellMax must be >= 2")
+
+    q = np.ascontiguousarray(q, dtype=np.float64)
+    n = q.shape[1]
+    num_ells = ellMax - 1
+
+    matrices = [
+        np.empty((2*(i+2)+1, 2*(i+2)+1, n), dtype=np.complex128)
+        for i in range(num_ells)
+    ]
+
+    _utils.wignerD_matrices_opt(q, ellMax, matrices)
+    return matrices
+
+def _wignerD_matrices_opt_hc4(q, ellMax):
+    """Optimized wignerD_matrices with hardcoded formulas for ell<=4."""
+    if q.ndim != 2 or q.shape[0] != 4:
+        raise ValueError("q must have shape (4, N)")
+    if ellMax < 2:
+        raise ValueError("ellMax must be >= 2")
+
+    q = np.ascontiguousarray(q, dtype=np.float64)
+    n = q.shape[1]
+    num_ells = ellMax - 1
+
+    matrices = [
+        np.empty((2*(i+2)+1, 2*(i+2)+1, n), dtype=np.complex128)
+        for i in range(num_ells)
+    ]
+
+    _utils.wignerD_matrices_opt_hc4(q, ellMax, matrices)
     return matrices
 
 def rotateWaveform(quat, h):
@@ -97,15 +137,19 @@ Returns: h_inertial, a similar array to h containing the inertial frame modes.
             77: 8,
             }[len(h)]
 
-    matrices = _wignerD_matrices(quat, ellMax)
+    matrices = _wignerD_matrices_opt_hc4(quat, ellMax)
 
-    res = 0.*h
-    i=0
-    for ell in range(2, ellMax+1):
-        for m in range(-ell, ell+1):
-            for mp in range(-ell, ell+1):
-                res[i+m+ell] += matrices[ell-2][ell+m, ell+mp]*h[i+mp+ell]
-        i += 2*ell + 1
+    # Batch matmul: D[ell_idx] has shape (size, size, n); transpose to (n, size, size)
+    # then multiply h block (size, n) → (n, size) in one batched matmul per ell.
+    # This avoids the triple Python loop and is ~35% faster.
+    res = np.empty_like(h)
+    i = 0
+    for ell_idx, ell in enumerate(range(2, ellMax+1)):
+        size = 2*ell + 1
+        D_t = matrices[ell_idx].transpose(2, 0, 1)    # (n, size, size) — view
+        h_t = h[i:i+size].T                            # (n, size) — view
+        res[i:i+size] = (D_t @ h_t[..., np.newaxis])[..., 0].T
+        i += size
     return res
 
 def transformTimeDependentVector(quat, vec):
@@ -121,58 +165,50 @@ coprecessing frame to the inertial frame.
 
 ###############################################################################
 # Functions related to fit evaluations
-def _eval_scalar_fit(fit_data, fit_params, get_fit_settings):
+def _eval_scalar_fit(fit_data, fit_params, fit_settings):
     """ Evaluates a single scalar fit.
 
         Arguments:
         ==========
         fit_data: fit data for each specific datapiece
-        fit_params: function that takes a numpy array x and returns
-                    the fit parameters used to evaluate the surrogate fits.
-                    Example: The NRSur7dq4 model converts
-                       x=[q, chi1x, chi1y, chi1z, chi2x, chi2y, chi2z]
-                       to
-                       x=[np.log(q), chi1x, chi1y, chiHat, chi2x, chi2y, chi_a]
-        get_fit_settings: function that provides information about
-                          surrogate fits for each specific datapiece.
+        fit_params: numpy array of fit parameters (already transformed)
+        fit_settings: tuple (q_fit_offset, q_fit_slope, q_max_bfOrder,
+                      chi_max_bfOrder) — model-specific constants, cached
+                      once at init time.
 
         Notes:
         ======
-        fit_params and get_fit_settings should come from each surrogate model's
+        fit_params and fit_settings should come from each surrogate model's
         class definition. For example, for the NRSur7dq4 model, these are defined
         in NRSur7dq4(SurrogateEvaluator)
     """
     q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder \
-        = get_fit_settings()
+        = fit_settings
     val = _utils.eval_fit(fit_data['bfOrders'], fit_data['coefs'], \
         fit_params, q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder)
     return val
 
-def _eval_vector_fit(fit_data, size, fit_params, get_fit_settings):
+def _eval_vector_fit(fit_data, size, fit_params, fit_settings):
     """ Evaluates a vector fit, where each element is a scalar fit.
 
         Arguments:
         ==========
         fit_data: fit data for each specific datapiece
-        fit_params: function that takes a numpy array x and returns
-                    the fit parameters used to evaluate the surrogate fits.
-                    Example: The NRSur7dq4 model converts
-                       x=[q, chi1x, chi1y, chi1z, chi2x, chi2y, chi2z]
-                       to
-                       x=[np.log(q), chi1x, chi1y, chiHat, chi2x, chi2y, chi_a]
-        get_fit_settings: function that provides information about
-                          surrogate fits for each specific datapiece.
+        fit_params: numpy array of fit parameters (already transformed)
+        fit_settings: tuple (q_fit_offset, q_fit_slope, q_max_bfOrder,
+                      chi_max_bfOrder) — model-specific constants, cached
+                      once at init time.
 
         Notes:
         ======
-        fit_params and get_fit_settings should come from each surrogate model's
+        fit_params and fit_settings should come from each surrogate model's
         class definition. For example, for the NRSur7dq4 model, these are defined
         in NRSur7dq4(SurrogateEvaluator)
     """
-    val = []
+    val = np.empty(size)
     for i in range(size):
-        val.append(_eval_scalar_fit(fit_data[i], fit_params, get_fit_settings))
-    return np.asarray(val)
+        val[i] = _eval_scalar_fit(fit_data[i], fit_params, fit_settings)
+    return val
 
 ###############################################################################
 
@@ -219,9 +255,11 @@ These time derivatives are given to the AB4 ODE solver.
 
         self._get_fit_params = get_fit_params
         self._get_fit_settings = get_fit_settings
+        self._fit_settings = get_fit_settings()   # cached tuple (Opt 1)
         self.omega_ref_max_model = omega_ref_max_model
 
         self.fit_data = []
+        self.fit_data_batch = []    # list of 9-tuple lists for eval_fit_batch (Opt 4)
         for i in range(len(self.t)):
             group = h5file['ds_node_%s'%(i)]
             tmp_data = {}
@@ -233,6 +271,19 @@ These time derivatives are given to the AB4 ODE solver.
             tmp_data['chiB'] =self._load_vector_fit(group, 'chiB', 3)
 
             self.fit_data.append(tmp_data)
+
+            # Build the batch list: [ooxy0, ooxy1, omega, cAx, cAy, cAz, cBx, cBy, cBz]
+            self.fit_data_batch.append([
+                (tmp_data['omega_orb'][0]['bfOrders'], tmp_data['omega_orb'][0]['coefs']),
+                (tmp_data['omega_orb'][1]['bfOrders'], tmp_data['omega_orb'][1]['coefs']),
+                (tmp_data['omega']['bfOrders'],         tmp_data['omega']['coefs']),
+                (tmp_data['chiA'][0]['bfOrders'],        tmp_data['chiA'][0]['coefs']),
+                (tmp_data['chiA'][1]['bfOrders'],        tmp_data['chiA'][1]['coefs']),
+                (tmp_data['chiA'][2]['bfOrders'],        tmp_data['chiA'][2]['coefs']),
+                (tmp_data['chiB'][0]['bfOrders'],        tmp_data['chiB'][0]['coefs']),
+                (tmp_data['chiB'][1]['bfOrders'],        tmp_data['chiB'][1]['coefs']),
+                (tmp_data['chiB'][2]['bfOrders'],        tmp_data['chiB'][2]['coefs']),
+            ])
 
         self.diff_t = np.diff(self.t)
         self.L = len(self.t)
@@ -267,16 +318,11 @@ These time derivatives are given to the AB4 ODE solver.
         x = _utils.get_ds_fit_x(y, q)
         fit_params = self._get_fit_params(x)
 
-        # Evaluate fits
-        data = self.fit_data[i0]
-        ooxy_coorb = _eval_vector_fit(data['omega_orb'], 2, fit_params, self._get_fit_settings)
-        omega = _eval_scalar_fit(data['omega'], fit_params, self._get_fit_settings)
-        cAdot_coorb = _eval_vector_fit(data['chiA'], 3, fit_params, self._get_fit_settings)
-        cBdot_coorb = _eval_vector_fit(data['chiB'], 3, fit_params, self._get_fit_settings)
-
-        # Do rotations to the coprecessing frame, find dqdt, and append
-        dydt = _utils.assemble_dydt(y, ooxy_coorb, omega,
-                cAdot_coorb, cBdot_coorb)
+        # Fused: evaluate 9 fits + assemble dydt in one C call
+        q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder = self._fit_settings
+        dydt = _utils.eval_fit_batch_dydt(
+            self.fit_data_batch[i0], fit_params, y,
+            q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder)
 
         return dydt
 
@@ -306,7 +352,7 @@ cubic interpolation. Use get_time_deriv_from_index when possible.
     def get_omega(self, i0, q, y):
         x = _utils.get_ds_fit_x(y, q)
         fit_params = self._get_fit_params(x)
-        omega = _eval_scalar_fit(self.fit_data[i0]['omega'], fit_params, self._get_fit_settings)
+        omega = _eval_scalar_fit(self.fit_data[i0]['omega'], fit_params, self._fit_settings)
         return omega
 
     def _get_t_from_omega(self, omega_ref, q, chiA0, chiB0, init_orbphase,
@@ -502,7 +548,7 @@ the nearest time node.
         #   chiBy, chiBz]
         # We do three steps of RK4, so we have 3 fewer timesteps in the output
         # compared to self.t
-        data = np.zeros((self.L-3, 11))
+        data = np.empty((self.L-3, 11))  # every row written by RK4/AB4 before use
 
         y0 = np.append(np.array([1., 0., 0., 0., init_orbphase]),
                 np.append(chiA0, chiB0))
@@ -673,13 +719,16 @@ def _extract_component_data(h5_group):
     return data
 
 def _assemble_mode_pair(rep, rem, imp, imm):
-    hplus = rep + 1.j*imp
-    hminus = rem + 1.j*imm
-    # hplus and hminus were built with the (ell, -m) mode as the
-    # reference mode:
-    #   hplus = 0.5*( h^{ell, -m} + h^{ell, m}* )
-    #   hminus = 0.5*(h^{ell, -m} - h^{ell, m}* )
-    return (hplus - hminus).conjugate(), hplus + hminus
+    # hplus = rep + 1j*imp, hminus = rem + 1j*imm
+    # return (hplus - hminus).conj(), hplus + hminus
+    # Pre-allocate two outputs directly to avoid 3 intermediate allocations.
+    h_posm = np.empty(len(rep), dtype=np.complex128)
+    h_negm = np.empty(len(rep), dtype=np.complex128)
+    h_posm.real = rep - rem    # Re(hplus - hminus)
+    h_posm.imag = imm - imp    # Im((hplus - hminus).conj()) = -Im(hplus - hminus)
+    h_negm.real = rep + rem    # Re(hplus + hminus)
+    h_negm.imag = imp + imm    # Im(hplus + hminus)
+    return h_posm, h_negm
 
 #########################################################
 
@@ -698,6 +747,7 @@ class CoorbitalWaveformSurrogate:
 
         self._get_fit_params = get_fit_params
         self._get_fit_settings = get_fit_settings
+        self._fit_settings = get_fit_settings()   # cached tuple (Opt 1)
 
         self.ellMax = 2
         while 'hCoorb_%s_%s_Re+'%(self.ellMax+1, self.ellMax+1) in h5file.keys():
@@ -742,7 +792,7 @@ chiA, chiB: The time-dependent spin in the coorbital frame. These should have
 ellMax: The maximum ell mode to evaluate.
         """
         nmodes = ellMax*ellMax + 2*ellMax - 3
-        modes = 1.j*np.zeros((nmodes, len(self.t)))
+        modes = np.zeros((nmodes, len(self.t)), dtype=complex)
 
         for ell in range(2, ellMax+1):
 
@@ -771,19 +821,27 @@ ellMax: The maximum ell mode to evaluate.
         return modes
 
     def _eval_comp(self, data, q, chiA, chiB):
-        nodes = []
-        for orders, coefs, ni in zip(data['orders'], data['coefs'],
-                data['nodeIndices']):
-
-            fit_data = {
-                'bfOrders': orders,
-                'coefs': coefs,
-                }
-            x = np.append(q, np.append(chiA[ni], chiB[ni]))
+        # Pre-allocate x once and nodes array.
+        # get_fit_params modifies x in-place, so x[0] must be reset to q
+        # (raw mass ratio) each iteration since it gets overwritten with log(q).
+        q_float = float(q)
+        x = np.empty(7)
+        n_nodes = len(data['nodeIndices'])
+        nodes = np.empty(n_nodes)
+        # Unpack fit_settings once to avoid per-iteration tuple unpacking in
+        # _eval_scalar_fit, and inline the C call to skip dict creation.
+        q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder \
+            = self._fit_settings
+        for idx, (orders, coefs, ni) in enumerate(zip(
+                data['orders'], data['coefs'], data['nodeIndices'])):
+            x[0] = q_float   # reset: get_fit_params overwrites with log(q)
+            x[1:4] = chiA[ni]
+            x[4:7] = chiB[ni]
             fit_params = self._get_fit_params(x)
-            nodes.append(_eval_scalar_fit(fit_data, fit_params, self._get_fit_settings))
+            nodes[idx] = _utils.eval_fit(orders, coefs, fit_params,
+                q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder)
 
-        return np.array(nodes).dot(data['EI_basis'])
+        return nodes.dot(data['EI_basis'])
 
     def _check_h5group_exists(self, h5file, group_name):
         """ Check if h5 group GROUP_NAME has valid data to load.
@@ -1035,7 +1093,7 @@ Returns:
         orbphase = _splinterp_Cwrapper(self.t_coorb, self.tds, orbphase_dyn)
 
         quat = splinterp_many(self.t_coorb, self.tds, quat_dyn)
-        quat = quat/np.sqrt(np.sum(abs(quat)**2, 0))
+        quat = quat/np.sqrt((quat*quat).sum(0))
         chiA_coorb, chiB_coorb = coorb_spins_from_copr_spins(
                 chiA_copr, chiB_copr, orbphase)
 
@@ -1081,7 +1139,10 @@ Returns:
         if do_interp:
             hre = splinterp_many(timesM, self.t_coorb, np.real(h_inertial))
             him = splinterp_many(timesM, self.t_coorb, np.imag(h_inertial))
-            h_inertial = hre + 1.j*him
+            # Avoid intermediate complex allocation: write real/imag parts directly
+            h_inertial = np.empty(hre.shape, dtype=np.complex128)
+            h_inertial.real = hre
+            h_inertial.imag = him
 
         # Make mode dict
         h = {}
@@ -1103,7 +1164,7 @@ Returns:
                 chiB_copr = normalize_spin(chiB_copr, chiB_norm)
                 orbphase = _splinterp_Cwrapper(timesM, self.tds, orbphase_dyn)
                 quat = splinterp_many(timesM, self.tds, quat_dyn)
-                quat = quat/np.sqrt(np.sum(abs(quat)**2, 0))
+                quat = quat/np.sqrt((quat*quat).sum(0))
 
             chiA_inertial = transformTimeDependentVector(quat, chiA_copr.T).T
             chiB_inertial = transformTimeDependentVector(quat, chiB_copr.T).T

@@ -1,5 +1,7 @@
 double ipow(double base, long exponent);
 static PyObject *eval_fit(PyObject *self, PyObject *args);
+static PyObject *eval_fit_batch(PyObject *self, PyObject *args);
+static PyObject *eval_fit_batch_dydt(PyObject *self, PyObject *args);
 static PyObject *normalize_y(PyObject *self, PyObject *args);
 static PyObject *get_ds_fit_x(PyObject *self, PyObject *args);
 static PyObject *assemble_dydt(PyObject *self, PyObject *args);
@@ -11,3 +13,7 @@ double factorial_ratio(int n, int k);
 double _binomial(int n, int k);
 double _wigner_coef(int ell, int mp, int m);
 PyObject *py_wignerD_matrices(PyObject *self, PyObject *args);
+int wignerD_matrices_opt(const double *q, size_t n, int ellMax, double complex **matrices);
+int wignerD_matrices_opt_hc4(const double *q, size_t n, int ellMax, double complex **matrices);
+static PyObject *py_wignerD_matrices_opt(PyObject *self, PyObject *args);
+static PyObject *py_wignerD_matrices_opt_hc4(PyObject *self, PyObject *args);

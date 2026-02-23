@@ -2443,28 +2443,39 @@ See the __call__ method on how to evaluate waveforms.
         """
 
         # needed to convert user input x to parameters used by surrogate fits
+        # Opt 3: cache q-dependent constants (q is fixed per ODE integration)
+        _q_consts_cache = {}
+
         def get_fit_params(x):
             """ Converts from x=[q, chi1x, chi1y, chi1z, chi2x, chi2y, chi2z]
                 to x = [np.log(q), chi1x, chi1y, chiHat, chi2x, chi2y, chi_a]
                 chiHat is defined in Eq.(3) of 1508.07253.
                 chi_a = (chi1 - chi2)/2.
                 Both chiHat and chi_a always lie in range [-1, 1].
+
+                Modifies x in place (no np.copy) — all callers own the array.
             """
 
-            x = np.copy(x)
-
-            q = float(x[0])
+            # Read originals before overwriting (Opt 7: no np.copy allocation)
+            q_val = float(x[0])
             chi1z = float(x[3])
             chi2z = float(x[6])
-            eta = q/(1.+q)**2
-            chi_wtAvg = (q*chi1z+chi2z)/(1+q)
-            chiHat = (chi_wtAvg - 38.*eta/113.*(chi1z + chi2z)) \
-                /(1. - 76.*eta/113.)
-            chi_a = (chi1z - chi2z)/2.
 
-            x[0] = np.log(q)
-            x[3] = chiHat
-            x[6] = chi_a
+            if q_val not in _q_consts_cache:
+                eta = q_val / (1. + q_val)**2
+                _q_consts_cache[q_val] = (
+                    np.log(q_val),
+                    q_val / (1. + q_val),    # q/(1+q): coef of chi1z in chi_wtAvg
+                    1. / (1. + q_val),       # 1/(1+q): coef of chi2z in chi_wtAvg
+                    38. * eta / 113.,        # A: chi sum scale
+                    1. - 76. * eta / 113.,   # B_inv denominator
+                )
+            log_q, q_inv_1pq, inv_1pq, A, B_inv = _q_consts_cache[q_val]
+
+            chi_wtAvg = q_inv_1pq * chi1z + inv_1pq * chi2z
+            x[0] = log_q
+            x[3] = (chi_wtAvg - A * (chi1z + chi2z)) / B_inv
+            x[6] = (chi1z - chi2z) * 0.5
 
             return x
 
