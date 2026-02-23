@@ -13,7 +13,7 @@ import numpy as np
 import h5py
 from gwsurrogate.precessing_utils import _utils
 from gwtools.harmonics import sYlm
-from gwsurrogate.new.surrogate import _splinterp_Cwrapper, _splinterp_Cwrapper_many
+from gwsurrogate.new.surrogate import _splinterp_Cwrapper, _splinterp_Cwrapper_many, _splinterp_Cwrapper_many_complex
 import ctypes
 
 
@@ -1137,12 +1137,7 @@ Returns:
 
 
         if do_interp:
-            hre = splinterp_many(timesM, self.t_coorb, np.real(h_inertial))
-            him = splinterp_many(timesM, self.t_coorb, np.imag(h_inertial))
-            # Avoid intermediate complex allocation: write real/imag parts directly
-            h_inertial = np.empty(hre.shape, dtype=np.complex128)
-            h_inertial.real = hre
-            h_inertial.imag = him
+            h_inertial = _splinterp_Cwrapper_many_complex(timesM, self.t_coorb, h_inertial)
 
         # Make mode dict
         h = {}

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from scipy.interpolate import CubicSpline
 
-from gwsurrogate.spline_interp_Cwrapper import interpolate, interpolate_many
+from gwsurrogate.spline_interp_Cwrapper import interpolate, interpolate_many, interpolate_many_complex
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +168,72 @@ def test_interpolate_many_matches_scipy():
         expected = _natural_scipy(x, y[i], xnew)
         np.testing.assert_allclose(result[i], expected, atol=1e-10,
                                    err_msg=f"Row {i} disagrees with scipy")
+
+
+# ---------------------------------------------------------------------------
+# interpolate_many_complex — complex batch tests
+# ---------------------------------------------------------------------------
+
+def test_interpolate_many_complex_matches_split():
+    """interpolate_many_complex matches split real/imag via interpolate_many."""
+    M, N = 6, 40
+    x = np.linspace(0.0, 4.0, N)
+    y_complex = RNG.standard_normal((M, N)) + 1j * RNG.standard_normal((M, N))
+    xnew = np.linspace(0.2, 3.8, 120)
+
+    result = interpolate_many_complex(xnew, x, y_complex)
+
+    re = interpolate_many(xnew, x, np.real(y_complex))
+    im = interpolate_many(xnew, x, np.imag(y_complex))
+    expected = re + 1j * im
+
+    np.testing.assert_allclose(result.real, expected.real, atol=1e-12,
+                               err_msg="Real part mismatch")
+    np.testing.assert_allclose(result.imag, expected.imag, atol=1e-12,
+                               err_msg="Imag part mismatch")
+
+
+def test_interpolate_many_complex_matches_scipy():
+    """Each row matches scipy CubicSpline on real and imag separately."""
+    M, N = 4, 30
+    x = np.linspace(0.0, 2 * np.pi, N)
+    y_complex = np.stack([np.exp(1j * (k + 1) * x) for k in range(M)])
+    xnew = np.linspace(0.1, 2 * np.pi - 0.1, 100)
+
+    result = interpolate_many_complex(xnew, x, y_complex)
+    for i in range(M):
+        ref_re = _natural_scipy(x, np.real(y_complex[i]), xnew)
+        ref_im = _natural_scipy(x, np.imag(y_complex[i]), xnew)
+        np.testing.assert_allclose(result[i].real, ref_re, atol=1e-10,
+                                   err_msg=f"Row {i} real part disagrees with scipy")
+        np.testing.assert_allclose(result[i].imag, ref_im, atol=1e-10,
+                                   err_msg=f"Row {i} imag part disagrees with scipy")
+
+
+def test_interpolate_many_complex_shape_dtype():
+    """Output shape is (M, len(xnew)), dtype is complex128."""
+    M, N = 5, 25
+    x = np.linspace(0.0, 1.0, N)
+    y = RNG.standard_normal((M, N)) + 1j * RNG.standard_normal((M, N))
+    xnew = np.linspace(0.0, 1.0, 50)
+    result = interpolate_many_complex(xnew, x, y)
+    assert result.shape == (M, len(xnew)), (
+        f"Expected shape {(M, len(xnew))}, got {result.shape}"
+    )
+    assert result.dtype == np.complex128, f"Expected complex128, got {result.dtype}"
+
+
+def test_interpolate_many_complex_single_row():
+    """Single-row complex input matches split real/imag via interpolate."""
+    x = np.linspace(0.0, 3.0, 25)
+    y = np.sin(x) + 1j * np.cos(x)
+    xnew = np.linspace(0.1, 2.9, 80)
+
+    result = interpolate_many_complex(xnew, x, y[np.newaxis, :])
+    re = interpolate(xnew, x, np.real(y))
+    im = interpolate(xnew, x, np.imag(y))
+
+    np.testing.assert_allclose(result[0].real, re, atol=1e-12,
+                               err_msg="Single row real part mismatch")
+    np.testing.assert_allclose(result[0].imag, im, atol=1e-12,
+                               err_msg="Single row imag part mismatch")

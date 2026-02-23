@@ -105,6 +105,10 @@ def _splinterp_Cwrapper_many(xout, xin, yin):
     else:
         return spline_interp_Cwrapper.interpolate_many(xout, xin, yin)
 
+def _splinterp_Cwrapper_many_complex(xout, xin, yin):
+    """Interpolate multiple complex128 datasets sharing the same x-grid.
+    Uses natural cubic spline boundary conditions."""
+    return spline_interp_Cwrapper.interpolate_many_complex(xout, xin, yin)
 
 class ParamDim(SimpleH5Object):
     """
