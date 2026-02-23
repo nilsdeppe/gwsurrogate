@@ -137,19 +137,10 @@ Returns: h_inertial, a similar array to h containing the inertial frame modes.
             77: 8,
             }[len(h)]
 
-    matrices = _wignerD_matrices_opt_hc4(quat, ellMax)
-
-    # Batch matmul: D[ell_idx] has shape (size, size, n); transpose to (n, size, size)
-    # then multiply h block (size, n) → (n, size) in one batched matmul per ell.
-    # This avoids the triple Python loop and is ~35% faster.
+    quat = np.ascontiguousarray(quat, dtype=np.float64)
+    h = np.ascontiguousarray(h, dtype=np.complex128)
     res = np.empty_like(h)
-    i = 0
-    for ell_idx, ell in enumerate(range(2, ellMax+1)):
-        size = 2*ell + 1
-        D_t = matrices[ell_idx].transpose(2, 0, 1)    # (n, size, size) — view
-        h_t = h[i:i+size].T                            # (n, size) — view
-        res[i:i+size] = (D_t @ h_t[..., np.newaxis])[..., 0].T
-        i += size
+    _utils.rotate_waveform(quat, h, ellMax, res)
     return res
 
 def transformTimeDependentVector(quat, vec):
