@@ -7,23 +7,10 @@ import numpy
 # all extensions here
 extmods = []
 
-# build extension 1: python wrapper to gsl's spline function
-if os.path.isdir("/opt/local/include"):
-    IncDirs = ["/opt/local/include"]
-else:
-    IncDirs = []
-
-if os.path.isdir("/opt/local/lib"):
-    LibDirs = ["/opt/local/lib"]
-else:
-    LibDirs = []
-
+# build extension 1: custom spline interpolation (no external deps)
 extmod = Extension(
     "gwsurrogate.spline_interp_Cwrapper._spline_interp",
-    include_dirs=IncDirs,
-    libraries=["gsl"],
-    extra_compile_args=["-std=c99"],
-    library_dirs=LibDirs,
+    extra_compile_args=["-std=c99", "-O3"],
     sources=["gwsurrogate/spline_interp_Cwrapper/_spline_interp.c"],
 )
 extmods.append(extmod)
