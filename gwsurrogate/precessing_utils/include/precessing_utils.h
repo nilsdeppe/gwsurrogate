@@ -14,6 +14,7 @@ double _binomial(int n, int k);
 double _wigner_coef(int ell, int mp, int m);
 PyObject *py_wignerD_matrices(PyObject *self, PyObject *args);
 int wignerD_matrices_opt(const double *q, size_t n, int ellMax, double complex **matrices);
-int wignerD_matrices_opt_hc4(const double *q, size_t n, int ellMax, double complex **matrices);
+int wignerD_matrices_opt_hc4(const double *q, size_t n, int ellMax, double complex **matrices,
+                             const double complex *h_data, double complex *out_data);
 static PyObject *py_wignerD_matrices_opt(PyObject *self, PyObject *args);
 static PyObject *py_wignerD_matrices_opt_hc4(PyObject *self, PyObject *args);

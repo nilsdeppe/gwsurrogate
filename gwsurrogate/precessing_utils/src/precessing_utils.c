@@ -1670,7 +1670,9 @@ static void hc_ell4(const double * restrict cv, const double * restrict sv,
 }
 
 int wignerD_matrices_opt_hc4(const double * restrict q, size_t n, int ellMax,
-                             double complex ** restrict matrices)
+                             double complex ** restrict matrices,
+                             const double complex *h_data,
+                             double complex *out_data)
 {
     if (!q || !matrices || ellMax < 2 || n == 0) return -1;
 
@@ -1823,6 +1825,7 @@ int wignerD_matrices_opt_hc4(const double * restrict q, size_t n, int ellMax,
         build_unit_pows(ub, ub_inv, n1, P, ub_pw);
 
         /* ---- Hot loop over ell ---- */
+        size_t mode_offset = 0;
         for (int i = 0; i < NL; ++i) {
             int ell = i + 2;
             size_t dim = (size_t)(2*ell+1);
@@ -1958,10 +1961,58 @@ int wignerD_matrices_opt_hc4(const double * restrict q, size_t n, int ellMax,
                 }
             }
 
+            /* Fused matmul: reordered loop for SIMD auto-vectorization.
+             * Inner loop over t (stride-1) enables SSE/AVX on D and h.
+             */
+            if (h_data) {
+                const double complex *h_base = h_data + mode_offset * n;
+                double complex *out_base = out_data + mode_offset * n;
+                for (int row = 0; row < (int)dim; row++) {
+                    double complex *out_row = out_base + (size_t)row * n;
+                    /* Zero the output row */
+                    for (size_t t = 0; t < n; t++)
+                        out_row[t] = 0;
+                    /* Accumulate D[row,col,t] * h[col,t] */
+                    for (int col = 0; col < (int)dim; col++) {
+                        const double complex *D_rc = mat
+                            + (size_t)row * dim * n + (size_t)col * n;
+                        const double complex *h_col = h_base + (size_t)col * n;
+                        for (size_t t = 0; t < n; t++)
+                            out_row[t] += D_rc[t] * h_col[t];
+                    }
+                }
+                mode_offset += (size_t)dim;
+            }
+
             /* Rotate recurrence buffers */
             double *tmp = d_prev;
             d_prev = d_prev2;
             d_prev2 = tmp;
+        }
+    }
+
+    /* Fallback matmul when n1==0 (all edge cases, no general path ran) */
+    if (h_data && n1 == 0) {
+        size_t mode_offset = 0;
+        for (int i = 0; i < NL; ++i) {
+            int ell = i + 2;
+            size_t dim = (size_t)(2*ell+1);
+            const double complex *D = matrices[i];
+            const double complex *h_base = h_data + mode_offset * n;
+            double complex *out_base = out_data + mode_offset * n;
+            for (int row = 0; row < (int)dim; row++) {
+                double complex *out_row = out_base + (size_t)row * n;
+                for (size_t t = 0; t < n; t++)
+                    out_row[t] = 0;
+                for (int col = 0; col < (int)dim; col++) {
+                    const double complex *D_rc = D
+                        + (size_t)row * dim * n + (size_t)col * n;
+                    const double complex *h_col = h_base + (size_t)col * n;
+                    for (size_t t = 0; t < n; t++)
+                        out_row[t] += D_rc[t] * h_col[t];
+                }
+            }
+            mode_offset += dim;
         }
     }
 
@@ -2146,7 +2197,8 @@ static PyObject *py_wignerD_matrices_opt_hc4(PyObject *self, PyObject *args)
 
     int ret;
     Py_BEGIN_ALLOW_THREADS
-    ret = wignerD_matrices_opt_hc4(q_data, (size_t)n, ellMax, mat_ptrs);
+    ret = wignerD_matrices_opt_hc4(q_data, (size_t)n, ellMax, mat_ptrs,
+                                   NULL, NULL);
     Py_END_ALLOW_THREADS
 
     Py_DECREF(q_arr);
@@ -2381,7 +2433,7 @@ static PyObject *eval_coorb_modes(PyObject *self, PyObject *args) {
 
 
 /* ------------------------------------------------------------------ */
-/* rotate_waveform: compute wignerD + matrix-vector multiply in C     */
+/* rotate_waveform: quaternion inverse + wignerD + fused matmul in C  */
 /* ------------------------------------------------------------------ */
 
 static PyObject *py_rotate_waveform(PyObject *self, PyObject *args)
@@ -2435,13 +2487,32 @@ static PyObject *py_rotate_waveform(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    PyArrayObject *q_arr = (PyArrayObject *)PyArray_ContiguousFromAny(
+    /* Make a mutable copy of q for in-place quaternion inverse */
+    PyArrayObject *q_tmp = (PyArrayObject *)PyArray_ContiguousFromAny(
         (PyObject *)q_obj, NPY_DOUBLE, 2, 2);
+    if (!q_tmp) return NULL;
+    PyArrayObject *q_arr = (PyArrayObject *)PyArray_NewCopy(q_tmp, NPY_CORDER);
+    Py_DECREF(q_tmp);
     if (!q_arr) return NULL;
 
-    const double *q_data = (const double *)PyArray_DATA(q_arr);
+    double *q_mut = (double *)PyArray_DATA(q_arr);
     const double complex *h_data = (const double complex *)PyArray_DATA(h_obj);
     double complex *out_data = (double complex *)PyArray_DATA(out_obj);
+
+    /* Quaternion inverse in-place: conjugate / |q|^2.
+     * For unit quaternions this is just negating components 1,2,3.
+     * We include the normalization for robustness. */
+    for (npy_intp t = 0; t < N; t++) {
+        double q0 = q_mut[t];
+        double q1 = q_mut[N + t];
+        double q2 = q_mut[2*N + t];
+        double q3 = q_mut[3*N + t];
+        double inv_norm_sq = 1.0 / (q0*q0 + q1*q1 + q2*q2 + q3*q3);
+        q_mut[t]       =  q0 * inv_norm_sq;
+        q_mut[N + t]   = -q1 * inv_norm_sq;
+        q_mut[2*N + t] = -q2 * inv_norm_sq;
+        q_mut[3*N + t] = -q3 * inv_norm_sq;
+    }
 
     /* Allocate D matrices */
     double complex *mat_ptrs[num_ells];
@@ -2469,36 +2540,9 @@ static PyObject *py_rotate_waveform(PyObject *self, PyObject *args)
     int ret;
     Py_BEGIN_ALLOW_THREADS
 
-    /* Step 1: compute Wigner D matrices */
-    ret = wignerD_matrices_opt_hc4(q_data, (size_t)N, ellMax, mat_ptrs);
-
-    if (ret == 0) {
-        /* Step 2: matrix-vector multiply per ell block, per time step.
-         * D layout: (dim, dim, N) C-contiguous via D[row * dim * N + col * N + t]
-         * h layout: (n_modes, N) C-contiguous, so h[mode][t] = h_data[mode * N + t]
-         */
-        size_t mode_offset = 0;
-        for (int i = 0; i < num_ells; i++) {
-            int ell = i + 2;
-            int dim = 2 * ell + 1;
-            const double complex *D = mat_ptrs[i];
-
-            for (int row = 0; row < dim; row++) {
-                double complex *out_row = out_data + (mode_offset + row) * N;
-                const double complex *h_base = h_data + mode_offset * N;
-
-                for (size_t t = 0; t < (size_t)N; t++) {
-                    double complex acc = 0;
-                    for (int col = 0; col < dim; col++) {
-                        acc += D[(size_t)row * dim * N + (size_t)col * N + t]
-                             * h_base[(size_t)col * N + t];
-                    }
-                    out_row[t] = acc;
-                }
-            }
-            mode_offset += dim;
-        }
-    }
+    /* Compute Wigner D matrices with fused matmul (reordered loops) */
+    ret = wignerD_matrices_opt_hc4(q_mut, (size_t)N, ellMax, mat_ptrs,
+                                   h_data, out_data);
 
     Py_END_ALLOW_THREADS
 
