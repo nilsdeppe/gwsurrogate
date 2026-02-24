@@ -1077,7 +1077,7 @@ Returns:
         orbphase = _splinterp_Cwrapper(self.t_coorb, self.tds, orbphase_dyn)
 
         quat = splinterp_many(self.t_coorb, self.tds, quat_dyn)
-        quat = quat/np.sqrt(np.sum(abs(quat)**2, 0))
+        quat = quat/np.sqrt((quat*quat).sum(0))
         chiA_coorb, chiB_coorb = coorb_spins_from_copr_spins(
                 chiA_copr, chiB_copr, orbphase)
 
@@ -1143,7 +1143,7 @@ Returns:
                 chiB_copr = normalize_spin(chiB_copr, chiB_norm)
                 orbphase = _splinterp_Cwrapper(timesM, self.tds, orbphase_dyn)
                 quat = splinterp_many(timesM, self.tds, quat_dyn)
-                quat = quat/np.sqrt(np.sum(abs(quat)**2, 0))
+                quat = quat/np.sqrt((quat*quat).sum(0))
 
             chiA_inertial = transformTimeDependentVector(quat, chiA_copr.T).T
             chiB_inertial = transformTimeDependentVector(quat, chiB_copr.T).T
