@@ -514,3 +514,162 @@ int spline_interp_multi(const long data_size, const long out_size,
     spline_plan_free(plan);
     return rc;
 }
+
+/* =========================================================================
+ * spline_interp_multi_complex
+ *
+ * Interpolate num_datasets complex128 y-vectors sharing the same x-grid.
+ * Each complex double is stored as two consecutive doubles (re, im) —
+ * matching NumPy complex128 / C99 double _Complex layout.
+ *
+ * data_y[d] points to data_size pairs of (re,im) = 2*data_size doubles
+ * out_y[d]  points to out_size  pairs of (re,im) = 2*out_size  doubles
+ * ====================================================================== */
+int spline_interp_multi_complex(const long data_size, const long out_size,
+                                const long num_datasets,
+                                const double *restrict data_x,
+                                const double *const *restrict data_y,
+                                const double *restrict out_x,
+                                double *const *restrict out_y)
+{
+    if (out_size <= 0) return SPLINE_ERR_OUT_SIZE;
+    if (num_datasets <= 0) return SPLINE_ERR_NUM_DS;
+
+    int err = SPLINE_OK;
+    spline_plan *plan = spline_prepare(data_x, data_size, &err);
+    if (SPLINE_UNLIKELY(!plan)) return err;
+
+    const long   n        = plan->n;
+    const long   ni       = n - 2;
+    const double *restrict h        = plan->h;
+    const double *restrict inv_h    = plan->inv_h;
+    const double *restrict diag_fac = plan->diag;
+
+    /* Allocation: 2*n*num_datasets for c arrays (re+im) + 2*ni for rhs scratch + idx buf */
+    const size_t c_sz   = (size_t)(2 * n) * (size_t)num_datasets * sizeof(double);
+    const size_t rhs_sz = (size_t)(2 * ni) * sizeof(double);
+    const size_t idx_sz = (size_t)out_size * sizeof(int);
+    unsigned char *mem = (unsigned char *)malloc(c_sz + rhs_sz + idx_sz);
+    if (SPLINE_UNLIKELY(!mem)) { spline_plan_free(plan); return SPLINE_ERR_OOM; }
+
+    double *restrict c_all   = (double *)mem;
+    double *restrict rhs_buf = (double *)(mem + c_sz);
+    int    *restrict idx_buf = (int *)(mem + c_sz + rhs_sz);
+
+    /* -------------------------------------------------------------------
+     * Phase 1: Tridiagonal solve for c_re and c_im (one per dataset).
+     * The tridiagonal matrix depends only on x-grid (purely real).
+     * We solve two independent RHS for real and imag parts.
+     * ------------------------------------------------------------------- */
+    for (long d = 0; d < num_datasets; ++d) {
+        const double *restrict y_interleaved = data_y[d]; /* re0,im0,re1,im1,... */
+        double *restrict c_re = c_all + d * (2 * n);
+        double *restrict c_im = c_re + n;
+        double *restrict rhs_re = rhs_buf;
+        double *restrict rhs_im = rhs_buf + ni;
+
+        c_re[0] = 0.0; c_re[n - 1] = 0.0;
+        c_im[0] = 0.0; c_im[n - 1] = 0.0;
+
+        /* k=0, i=1 */
+        {
+            const double y0_re = y_interleaved[0*2], y1_re = y_interleaved[1*2], y2_re = y_interleaved[2*2];
+            const double y0_im = y_interleaved[0*2+1], y1_im = y_interleaved[1*2+1], y2_im = y_interleaved[2*2+1];
+            rhs_re[0] = 6.0 * SPLINE_FMA( y2_re, inv_h[1],
+                                 SPLINE_FMA(-y1_re, inv_h[1] + inv_h[0],
+                                             y0_re * inv_h[0]));
+            rhs_im[0] = 6.0 * SPLINE_FMA( y2_im, inv_h[1],
+                                 SPLINE_FMA(-y1_im, inv_h[1] + inv_h[0],
+                                             y0_im * inv_h[0]));
+        }
+
+        /* k=1..ni-1, i=2..n-2 */
+        for (long k = 1; k < ni; ++k) {
+            const long i = k + 1;
+            const double yi1_re = y_interleaved[(i+1)*2], yi_re = y_interleaved[i*2], yim1_re = y_interleaved[(i-1)*2];
+            const double yi1_im = y_interleaved[(i+1)*2+1], yi_im = y_interleaved[i*2+1], yim1_im = y_interleaved[(i-1)*2+1];
+            const double raw_re = 6.0 * SPLINE_FMA( yi1_re, inv_h[i],
+                                          SPLINE_FMA(-yi_re, inv_h[i] + inv_h[i-1],
+                                                      yim1_re * inv_h[i-1]));
+            const double raw_im = 6.0 * SPLINE_FMA( yi1_im, inv_h[i],
+                                          SPLINE_FMA(-yi_im, inv_h[i] + inv_h[i-1],
+                                                      yim1_im * inv_h[i-1]));
+            const double factor = h[k] / diag_fac[k-1];
+            rhs_re[k] = raw_re - factor * rhs_re[k-1];
+            rhs_im[k] = raw_im - factor * rhs_im[k-1];
+        }
+
+        /* Back-substitution */
+        c_re[n-2] = rhs_re[ni-1] / diag_fac[ni-1];
+        c_im[n-2] = rhs_im[ni-1] / diag_fac[ni-1];
+
+        for (long k = ni-2; k >= 0; --k) {
+            const long i = k + 1;
+            c_re[i] = (rhs_re[k] - h[k+1] * c_re[i+1]) / diag_fac[k];
+            c_im[i] = (rhs_im[k] - h[k+1] * c_im[i+1]) / diag_fac[k];
+        }
+    }
+
+    /* -------------------------------------------------------------------
+     * Phase 2a: Precompute interval indices for all output points.
+     * ------------------------------------------------------------------- */
+    {
+        int prev_idx = 0;
+        for (long j = 0; j < out_size; ++j) {
+            const int idx = hunt(data_x, (int)n, out_x[j], prev_idx);
+            if (SPLINE_UNLIKELY(idx < 0)) {
+                free(mem);
+                spline_plan_free(plan);
+                return SPLINE_ERR_BOUNDS;
+            }
+            idx_buf[j] = idx;
+            prev_idx = idx;
+        }
+    }
+
+    /* -------------------------------------------------------------------
+     * Phase 2b: Evaluate spline — d-outer for cache locality on c/y rows,
+     *           j-inner for stride-1 writes, interleaved complex output.
+     * ------------------------------------------------------------------- */
+    for (long d = 0; d < num_datasets; ++d) {
+        const double *restrict y = data_y[d];
+        const double *restrict c_re = c_all + d * (2 * n);
+        const double *restrict c_im = c_re + n;
+        double *restrict out_row = out_y[d];
+
+#if defined(__clang__)
+#  pragma clang loop vectorize(enable) interleave(enable)
+#elif defined(__GNUC__)
+#  pragma GCC ivdep
+#endif
+        for (long j = 0; j < out_size; ++j) {
+            const int    idx     = idx_buf[j];
+            const double t       = out_x[j] - data_x[idx];
+            const double inv_hi  = inv_h[idx];
+            const double hi_inv6 = h[idx] * (1.0 / 6.0);
+
+            /* Real part */
+            const double ci_re  = c_re[idx],  ci1_re = c_re[idx + 1];
+            const double d_re   = (ci1_re - ci_re) * inv_hi * (1.0/6.0);
+            const double y_re_i = y[idx*2],   y_re_i1 = y[(idx+1)*2];
+            const double b_re   = SPLINE_FMA(-hi_inv6,
+                                              SPLINE_FMA(2.0, ci_re, ci1_re),
+                                              (y_re_i1 - y_re_i) * inv_hi);
+
+            /* Imaginary part */
+            const double ci_im  = c_im[idx],  ci1_im = c_im[idx + 1];
+            const double d_im   = (ci1_im - ci_im) * inv_hi * (1.0/6.0);
+            const double y_im_i = y[idx*2+1], y_im_i1 = y[(idx+1)*2+1];
+            const double b_im   = SPLINE_FMA(-hi_inv6,
+                                              SPLINE_FMA(2.0, ci_im, ci1_im),
+                                              (y_im_i1 - y_im_i) * inv_hi);
+
+            out_row[j*2]     = SPLINE_FMA(t, SPLINE_FMA(t, SPLINE_FMA(t, d_re, ci_re*0.5), b_re), y_re_i);
+            out_row[j*2 + 1] = SPLINE_FMA(t, SPLINE_FMA(t, SPLINE_FMA(t, d_im, ci_im*0.5), b_im), y_im_i);
+        }
+    }
+
+    free(mem);
+    spline_plan_free(plan);
+    return SPLINE_OK;
+}

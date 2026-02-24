@@ -36,6 +36,13 @@ else:
       POINTER(c_double),
       POINTER(POINTER(c_double)),
   ], restype=c_int)
+  c_interp_multi_complex = _load_c_func(spline_libs[0], 'spline_interp_multi_complex', [
+      c_long, c_long, c_long,
+      POINTER(c_double),          # data_x
+      POINTER(POINTER(c_double)), # data_y (interleaved re,im)
+      POINTER(c_double),          # out_x
+      POINTER(POINTER(c_double)), # out_y  (interleaved re,im)
+  ], restype=c_int)
 
 _SPLINE_ERRORS = {
     1: 'Memory allocation failed in spline interpolation',
@@ -120,6 +127,47 @@ def interpolate_many(xnew, x, y):
 
     rc = c_interp_multi(x.shape[0], xnew.shape[0], n_datasets, x_p, y_ptrs, xnew_p,
                         ynew_ptrs)
+    _check_spline_rc(rc)
+
+    return ynew
+
+def interpolate_many_complex(xnew, x, y):
+    """Interpolate multiple complex128 datasets sharing the same x-grid.
+
+    Parameters
+    ----------
+    xnew : (M,) float64 array — evaluation points
+    x    : (N,) float64 array — knot x-coordinates
+    y    : (num_datasets, N) complex128 array — data values
+
+    Returns
+    -------
+    ynew : (num_datasets, M) complex128 array
+    """
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    y = np.ascontiguousarray(y, dtype=np.complex128)
+    xnew = np.ascontiguousarray(xnew, dtype=np.float64)
+
+    n_datasets, n_x = y.shape
+    n_out = xnew.shape[0]
+
+    x_p    = x.ctypes.data_as(POINTER(c_double))
+    xnew_p = xnew.ctypes.data_as(POINTER(c_double))
+
+    ynew = np.empty((n_datasets, n_out), dtype=np.complex128)
+
+    # Each complex128 row is 2*n doubles interleaved (re,im,re,im,...)
+    row_bytes = n_x  * 16  # sizeof(complex128) = 16
+    out_bytes = n_out * 16
+
+    PtrArr = POINTER(c_double) * n_datasets
+    y_ptrs    = PtrArr(*(ctypes.cast(y.ctypes.data    + d * row_bytes,
+                                     POINTER(c_double)) for d in range(n_datasets)))
+    ynew_ptrs = PtrArr(*(ctypes.cast(ynew.ctypes.data + d * out_bytes,
+                                     POINTER(c_double)) for d in range(n_datasets)))
+
+    rc = c_interp_multi_complex(n_x, n_out, n_datasets, x_p, y_ptrs, xnew_p,
+                                ynew_ptrs)
     _check_spline_rc(rc)
 
     return ynew

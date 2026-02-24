@@ -82,6 +82,11 @@ def _splinterp(xout, xin, yin, k=3, ext='const'):
     else:
         return _iuspline(xin, yin, k=k, ext=ext)(xout)
 
+def _splinterp_Cwrapper_many_complex(xout, xin, yin):
+    """Interpolate multiple complex128 datasets sharing the same x-grid.
+    Uses natural cubic spline boundary conditions."""
+    return spline_interp_Cwrapper.interpolate_many_complex(xout, xin, yin)
+
 def _splinterp_Cwrapper(xout, xin, yin):
     """Uses gsl splines with a wrapper to interpolate real or complex data.
     Uses natural boundary conditions instead of not-a-knot boundary conditions
@@ -89,9 +94,11 @@ def _splinterp_Cwrapper(xout, xin, yin):
     if len(xin) != len(yin):
         raise Exception('Expected x and y input lengths to match.')
     if np.iscomplexobj(yin):
-        re = _splinterp_Cwrapper(xout, xin, np.real(yin))
-        im = _splinterp_Cwrapper(xout, xin, np.imag(yin))
-        return re + 1.j*im
+        if yin.ndim == 1:
+            # interpolate_many_complex expects a 2D (n_datasets, N) array.
+            # Reshape to (1, N) without copying, then return the single output row.
+            return _splinterp_Cwrapper_many_complex(xout, xin, yin[np.newaxis, :])[0]
+        return _splinterp_Cwrapper_many_complex(xout, xin, yin)
     else:
         return spline_interp_Cwrapper.interpolate(xout, xin, yin)
 
