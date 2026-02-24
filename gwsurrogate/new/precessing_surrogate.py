@@ -73,6 +73,44 @@ http://arxiv.org/abs/1302.2919
 
     return matrices
 
+def _wignerD_matrices_opt(q, ellMax):
+    """Optimized wignerD_matrices: symmetry, real/complex separation, recurrence."""
+    if q.ndim != 2 or q.shape[0] != 4:
+        raise ValueError("q must have shape (4, N)")
+    if ellMax < 2:
+        raise ValueError("ellMax must be >= 2")
+
+    q = np.ascontiguousarray(q, dtype=np.float64)
+    n = q.shape[1]
+    num_ells = ellMax - 1
+
+    matrices = [
+        np.empty((2*(i+2)+1, 2*(i+2)+1, n), dtype=np.complex128)
+        for i in range(num_ells)
+    ]
+
+    _utils.wignerD_matrices_opt(q, ellMax, matrices)
+    return matrices
+
+def _wignerD_matrices_opt_hc4(q, ellMax):
+    """Optimized wignerD_matrices with hardcoded formulas for ell<=4."""
+    if q.ndim != 2 or q.shape[0] != 4:
+        raise ValueError("q must have shape (4, N)")
+    if ellMax < 2:
+        raise ValueError("ellMax must be >= 2")
+
+    q = np.ascontiguousarray(q, dtype=np.float64)
+    n = q.shape[1]
+    num_ells = ellMax - 1
+
+    matrices = [
+        np.empty((2*(i+2)+1, 2*(i+2)+1, n), dtype=np.complex128)
+        for i in range(num_ells)
+    ]
+
+    _utils.wignerD_matrices_opt_hc4(q, ellMax, matrices)
+    return matrices
+
 def rotateWaveform(quat, h):
     """
 Transforms a waveform from the coprecessing frame to the inertial frame.
