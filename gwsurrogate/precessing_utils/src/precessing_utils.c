@@ -58,6 +58,8 @@ static struct module_state _state;
 /* ==== Setup the python methods table === */
 static PyMethodDef _utils_methods[] = {
     {"eval_fit", eval_fit, METH_VARARGS},
+    {"eval_fit_batch", eval_fit_batch, METH_VARARGS},
+    {"eval_fit_batch_dydt", eval_fit_batch_dydt, METH_VARARGS},
     {"normalize_y", normalize_y, METH_VARARGS},
     {"get_ds_fit_x", get_ds_fit_x, METH_VARARGS},
     {"assemble_dydt", assemble_dydt, METH_VARARGS},
@@ -222,6 +224,90 @@ static PyObject *eval_fit(PyObject *self, PyObject *args) {
 
 
 /*
+ * Evaluates a batch of scalar fits sharing the same x (fit_params) vector.
+ * This avoids recomputing x_powers for each fit, reducing overhead by ~9x
+ * compared to calling eval_fit 9 times per ODE step.
+ *
+ * Arguments (with python data types):
+ *      fit_list:  A Python list of (bfOrders, coefs) tuples, one per fit.
+ *                 bfOrders: 2d int numpy array shape (n_coefs, 7)
+ *                 coefs: 1d float numpy array length n_coefs
+ *      x:             A 1d float numpy array with length 7 (fit parameters).
+ *      q_fit_offset:  A double.
+ *      q_fit_slope:   A double.
+ *      q_max_bfOrder: An int.
+ *      chi_max_bfOrder: An int.
+ *
+ * Returns a 1d float numpy array of length len(fit_list) with results.
+ */
+static PyObject *eval_fit_batch(PyObject *self, PyObject *args) {
+
+    PyObject *fit_list;
+    PyArrayObject *x;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+
+    if (!PyArg_ParseTuple(args, "OO!ddii",
+            &fit_list,
+            &PyArray_Type, &x,
+            &q_fit_offset,
+            &q_fit_slope,
+            &q_max_bfOrder,
+            &chi_max_bfOrder)) return NULL;
+
+    double *x_data = (double *) PyArray_DATA(x);
+    int n_fits = (int) PyList_GET_SIZE(fit_list);
+
+    /* Pre-compute x_powers once for all fits in the batch */
+    double x_powers[q_max_bfOrder+1 + 6*(chi_max_bfOrder+1)];
+    int i, j, base_idx;
+    for (i=0; i <= q_max_bfOrder; i++) {
+        x_powers[i] = ipow(q_fit_offset + q_fit_slope * x_data[0], i);
+    }
+    for (i=0; i <= chi_max_bfOrder; i++) {
+        for (j=1; j<7; j++) {
+            base_idx = q_max_bfOrder+1 + (chi_max_bfOrder+1)*(j-1);
+            x_powers[base_idx + i] = ipow(x_data[j], i);
+        }
+    }
+
+    /* Allocate output array */
+    npy_intp dims[1] = {n_fits};
+    PyArrayObject *result = (PyArrayObject *) PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (!result) return NULL;
+    double *result_data = (double *) PyArray_DATA(result);
+
+    /* Evaluate each fit using the shared x_powers */
+    int k, n;
+    for (k=0; k<n_fits; k++) {
+        PyObject *fit_tuple = PyList_GET_ITEM(fit_list, k);
+        PyArrayObject *bf_orders = (PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 0);
+        PyArrayObject *coefs_arr = (PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1);
+
+        long *bf_order_data = (long *) PyArray_DATA(bf_orders);
+        double *coef_data   = (double *) PyArray_DATA(coefs_arr);
+        n = (int) PyArray_DIMS(coefs_arr)[0];
+
+        double res = 0.0;
+        long *orders;
+        double prod;
+        for (i=0; i<n; i++) {
+            orders = bf_order_data + i*7;
+            prod = x_powers[orders[0]];
+            for (j=1; j<7; j++) {
+                base_idx = q_max_bfOrder+1 + (chi_max_bfOrder+1)*(j-1);
+                prod *= x_powers[base_idx + orders[j]];
+            }
+            res += coef_data[i] * prod;
+        }
+        result_data[k] = res;
+    }
+
+    return PyArray_Return(result);
+}
+
+
+/*
  * This is a helper function to normalize unit quaternions and spin magnitudes
  * at each time step during the ODE integration.
  * Arguments (with python data types):
@@ -331,6 +417,113 @@ static PyObject *get_ds_fit_x(PyObject *self, PyObject *args) {
 
     return PyArray_Return(x);
 }
+
+/*
+ * Fused eval_fit_batch + assemble_dydt: evaluates 9 polynomial fits and
+ * assembles the ODE right-hand-side in a single C call.
+ *
+ * Arguments:
+ *      fit_list:   Python list of 9 tuples (bf_orders, coefs)
+ *      fit_params: length-7 float numpy array (transformed fit parameters)
+ *      y:          length-11 float numpy array (quat, orbphase, chiA_copr, chiB_copr)
+ *      q_fit_offset, q_fit_slope: doubles for q rescaling
+ *      q_max_bfOrder, chi_max_bfOrder: ints for max basis function orders
+ *
+ * Returns a length-11 float numpy array dydt.
+ */
+static PyObject *eval_fit_batch_dydt(PyObject *self, PyObject *args) {
+
+    PyObject *fit_list;
+    PyArrayObject *fit_params, *y;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+
+    if (!PyArg_ParseTuple(args, "OO!O!ddii",
+            &fit_list,
+            &PyArray_Type, &fit_params,
+            &PyArray_Type, &y,
+            &q_fit_offset,
+            &q_fit_slope,
+            &q_max_bfOrder,
+            &chi_max_bfOrder)) return NULL;
+
+    double *x_data = (double *) PyArray_DATA(fit_params);
+    double *y_data = (double *) PyArray_DATA(y);
+
+    /* Pre-compute x_powers once for all fits */
+    double x_powers[q_max_bfOrder+1 + 6*(chi_max_bfOrder+1)];
+    int i, j, base_idx;
+    for (i=0; i <= q_max_bfOrder; i++) {
+        x_powers[i] = ipow(q_fit_offset + q_fit_slope * x_data[0], i);
+    }
+    for (i=0; i <= chi_max_bfOrder; i++) {
+        for (j=1; j<7; j++) {
+            base_idx = q_max_bfOrder+1 + (chi_max_bfOrder+1)*(j-1);
+            x_powers[base_idx + i] = ipow(x_data[j], i);
+        }
+    }
+
+    /* Evaluate 9 fits into stack array */
+    double results[9];
+    int k, n;
+    for (k=0; k<9; k++) {
+        PyObject *fit_tuple = PyList_GET_ITEM(fit_list, k);
+        PyArrayObject *bf_orders = (PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 0);
+        PyArrayObject *coefs_arr = (PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1);
+
+        long *bf_order_data = (long *) PyArray_DATA(bf_orders);
+        double *coef_data   = (double *) PyArray_DATA(coefs_arr);
+        n = (int) PyArray_DIMS(coefs_arr)[0];
+
+        double res = 0.0;
+        long *orders;
+        double prod;
+        for (i=0; i<n; i++) {
+            orders = bf_order_data + i*7;
+            prod = x_powers[orders[0]];
+            for (j=1; j<7; j++) {
+                base_idx = q_max_bfOrder+1 + (chi_max_bfOrder+1)*(j-1);
+                prod *= x_powers[base_idx + orders[j]];
+            }
+            res += coef_data[i] * prod;
+        }
+        results[k] = res;
+    }
+
+    /* Assemble dydt from results: ooxy=results[0:2], omega=results[2],
+       cAdot=results[3:6], cBdot=results[6:9] */
+    npy_intp dims[1] = {11};
+    PyArrayObject *dydt = (PyArrayObject *) PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (!dydt) return NULL;
+    double *dydt_data = (double *) PyArray_DATA(dydt);
+
+    double cp = cos(y_data[4]);
+    double sp = sin(y_data[4]);
+
+    /* Rotate ooxy from coorbital to coprecessing frame */
+    double ooxy_x = results[0]*cp - results[1]*sp;
+    double ooxy_y = results[0]*sp + results[1]*cp;
+
+    /* Quaternion derivative */
+    dydt_data[0] = (-0.5)*y_data[1]*ooxy_x - 0.5*y_data[2]*ooxy_y;
+    dydt_data[1] = (-0.5)*y_data[3]*ooxy_y + 0.5*y_data[0]*ooxy_x;
+    dydt_data[2] = 0.5*y_data[3]*ooxy_x + 0.5*y_data[0]*ooxy_y;
+    dydt_data[3] = 0.5*y_data[1]*ooxy_y - 0.5*y_data[2]*ooxy_x;
+
+    /* Orbital phase derivative */
+    dydt_data[4] = results[2];
+
+    /* Spin derivatives: rotate from coorbital to coprecessing */
+    dydt_data[5] = results[3]*cp - results[4]*sp;
+    dydt_data[6] = results[3]*sp + results[4]*cp;
+    dydt_data[7] = results[5];
+    dydt_data[8] = results[6]*cp - results[7]*sp;
+    dydt_data[9] = results[6]*sp + results[7]*cp;
+    dydt_data[10] = results[8];
+
+    return PyArray_Return(dydt);
+}
+
 
 /*
  * This function assembles the right-hand-side of the dynamics ODE integration
