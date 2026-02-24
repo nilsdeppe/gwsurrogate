@@ -95,6 +95,16 @@ def _splinterp_Cwrapper(xout, xin, yin):
     else:
         return spline_interp_Cwrapper.interpolate(xout, xin, yin)
 
+def _splinterp_Cwrapper_many(xout, xin, yin):
+    """Batch spline interpolation for multiple datasets sharing the same x grid.
+    Uses natural boundary conditions."""
+    if np.iscomplexobj(yin):
+        re = _splinterp_Cwrapper_many(xout, xin, np.real(yin))
+        im = _splinterp_Cwrapper_many(xout, xin, np.imag(yin))
+        return re + 1.j*im
+    else:
+        return spline_interp_Cwrapper.interpolate_many(xout, xin, yin)
+
 
 class ParamDim(SimpleH5Object):
     """
@@ -1297,6 +1307,8 @@ class AlignedSpinCoOrbitalFrameSurrogateTidal(AlignedSpinCoOrbitalFrameSurrogate
         # interpolation in the 'v' domain as that is where most of the PN
         # quantities are defined
         v_uniform = _splinterp_Cwrapper(timesM, timesM_tmp, v[:find])
+        v_uniform[0]  = max(v_uniform[0],  v[0])
+        v_uniform[-1] = min(v_uniform[-1], v[find-1])
 
         Amp_22 = _splinterp_Cwrapper(v_uniform, v[:find], Amp_22[:find])
         phi_22 = _splinterp_Cwrapper(v_uniform, v[:find], phi_22)
