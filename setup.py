@@ -32,9 +32,10 @@ extmods = []
 # build extension 1: custom spline interpolation (no external deps)
 extmod = Extension(
     "gwsurrogate.spline_interp_Cwrapper._spline_interp",
-    extra_compile_args=["-std=c99"] + _arch_flags,
+    extra_compile_args=["-std=c++14", "-O3"] + _arch_flags,
     extra_link_args=_arch_flags,
-    sources=["gwsurrogate/spline_interp_Cwrapper/_spline_interp.c"],
+    language="c++",
+    sources=["gwsurrogate/spline_interp_Cwrapper/_spline_interp.cpp"],
 )
 extmods.append(extmod)
 
