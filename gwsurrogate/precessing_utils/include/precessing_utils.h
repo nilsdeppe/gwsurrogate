@@ -6,6 +6,8 @@ static PyObject *normalize_y(PyObject *self, PyObject *args);
 static PyObject *get_ds_fit_x(PyObject *self, PyObject *args);
 static PyObject *assemble_dydt(PyObject *self, PyObject *args);
 static PyObject *ab4_dy(PyObject *self, PyObject *args);
+static PyObject *integrate_ab4_forward(PyObject *self, PyObject *args);
+static PyObject *integrate_ab4_backward(PyObject *self, PyObject *args);
 static PyObject *binom(PyObject *self, PyObject *args);
 static PyObject *wigner_coef(PyObject *self, PyObject *args);
 double factorial(int n);

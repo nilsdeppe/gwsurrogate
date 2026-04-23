@@ -274,6 +274,26 @@ These time derivatives are given to the AB4 ODE solver.
                 (tmp_data['chiB'][2]['bfOrders'],        tmp_data['chiB'][2]['coefs']),
             ])
 
+        # Build packed arrays for contiguous C access in AB4 loop.
+        # Layout: k-major (9 fits concatenated), each padded to N = max(n_k).
+        # orders_packed shape (9, N, 7) flat; coefs_packed shape (9, N) flat.
+        # ns_arr holds the 9 true coefficient counts per fit.
+        self.packed_fit_data = []
+        for node_batch in self.fit_data_batch:
+            ns = [co.shape[0] for bf, co in node_batch]
+            N = max(ns)
+            orders_packed = np.zeros((9, N, 7), dtype=np.int64)
+            coefs_packed = np.zeros((9, N), dtype=np.float64)
+            for k, (bf, co) in enumerate(node_batch):
+                orders_packed[k, :ns[k], :] = bf
+                coefs_packed[k, :ns[k]] = co
+            self.packed_fit_data.append((
+                np.ascontiguousarray(orders_packed.reshape(-1)),
+                np.ascontiguousarray(coefs_packed.reshape(-1)),
+                N,
+                np.array(ns, dtype=np.int32),
+            ))
+
         self.diff_t = np.diff(self.t)
         self.L = len(self.t)
 
@@ -663,24 +683,27 @@ fractional nodes.
         if i0 < 3:
             raise Exception("i0 must be at least 3!")
 
-        # Setup AB4
-        k1, k2, k3 = k_ab4
-        dt1, dt2, dt3 = dt_ab4
-
-        # Run AB4   (i0+3 due to 3 half time steps)
-        for i, dt4 in enumerate(self.diff_t[i0+3:]):
-            i_output = i0+i
-            k4 = self.get_time_deriv_from_index(i_output+3, q,
-                    y_of_t[i_output])
-
-            ynext = y_of_t[i_output] + _utils.ab4_dy(k1, k2, k3, k4, dt1,
-                    dt2, dt3, dt4)
-
-            y_of_t[i_output+1] = _utils.normalize_y(ynext, normA, normB)
-
-            # Setup for next iteration
-            k1, k2, k3 = k2, k3, k4
-            dt1, dt2, dt3 = dt2, dt3, dt4
+        if self._fit_params_mode >= 0:
+            _utils.integrate_ab4_forward(
+                self.packed_fit_data, y_of_t, q, normA, normB, i0,
+                k_ab4[0], k_ab4[1], k_ab4[2],
+                dt_ab4[0], dt_ab4[1], dt_ab4[2],
+                self.diff_t,
+                *self._fit_settings,
+                self._q_consts, self._fit_params_mode)
+        else:
+            # Legacy path: Python transform
+            k1, k2, k3 = k_ab4
+            dt1, dt2, dt3 = dt_ab4
+            for i, dt4 in enumerate(self.diff_t[i0+3:]):
+                i_output = i0+i
+                k4 = self.get_time_deriv_from_index(i_output+3, q,
+                        y_of_t[i_output])
+                ynext = y_of_t[i_output] + _utils.ab4_dy(k1, k2, k3, k4,
+                        dt1, dt2, dt3, dt4)
+                y_of_t[i_output+1] = _utils.normalize_y(ynext, normA, normB)
+                k1, k2, k3 = k2, k3, k4
+                dt1, dt2, dt3 = dt2, dt3, dt4
 
         return y_of_t
 
@@ -694,28 +717,33 @@ dt_ab4 is [t(i0 + 3) - t(i0 + 2), t(i0 + 2) - t(i0 + 1), t(i0 + 1) - t(i0)]
         if i0 > len(self.t) - 7:
             raise Exception("i0 must be <= len(self.t) - 7")
 
-        # Setup AB4
-        k1, k2, k3 = k_ab4
-        dt1, dt2, dt3 = dt_ab4
-
         # Setup dt array, removing the half steps
         dt_array = np.append(2 * self.diff_t[:6:2], self.diff_t[6:])
-        for i_output in range(i0)[::-1]:
-            node_index = i_output + 4
-            if i_output < 2:
-                node_index = 2 + 2*i_output
-            dt4 = dt_array[i_output]
-            k4 = self.get_time_deriv_from_index(node_index, q,
-                    y_of_t[i_output+1])
 
-            ynext = y_of_t[i_output+1] - _utils.ab4_dy(k1, k2, k3, k4,
-                    dt1, dt2, dt3, dt4)
-
-            y_of_t[i_output] = _utils.normalize_y(ynext, normA, normB)
-
-            # Setup for next iteration
-            k1, k2, k3 = k2, k3, k4
-            dt1, dt2, dt3 = dt2, dt3, dt4
+        if self._fit_params_mode >= 0:
+            _utils.integrate_ab4_backward(
+                self.packed_fit_data, y_of_t, q, normA, normB, i0,
+                k_ab4[0], k_ab4[1], k_ab4[2],
+                dt_ab4[0], dt_ab4[1], dt_ab4[2],
+                dt_array,
+                *self._fit_settings,
+                self._q_consts, self._fit_params_mode)
+        else:
+            # Legacy path: Python transform
+            k1, k2, k3 = k_ab4
+            dt1, dt2, dt3 = dt_ab4
+            for i_output in range(i0)[::-1]:
+                node_index = i_output + 4
+                if i_output < 2:
+                    node_index = 2 + 2*i_output
+                dt4 = dt_array[i_output]
+                k4 = self.get_time_deriv_from_index(node_index, q,
+                        y_of_t[i_output+1])
+                ynext = y_of_t[i_output+1] - _utils.ab4_dy(k1, k2, k3, k4,
+                        dt1, dt2, dt3, dt4)
+                y_of_t[i_output] = _utils.normalize_y(ynext, normA, normB)
+                k1, k2, k3 = k2, k3, k4
+                dt1, dt2, dt3 = dt2, dt3, dt4
 
         return y_of_t
 #########################################################

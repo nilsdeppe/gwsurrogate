@@ -73,6 +73,8 @@ static PyMethodDef _utils_methods[] = {
     {"wignerD_matrices", py_wignerD_matrices, METH_VARARGS},
     {"rotate_waveform", py_rotate_waveform, METH_VARARGS},
     {"eval_coorb_modes", eval_coorb_modes, METH_VARARGS},
+    {"integrate_ab4_forward", integrate_ab4_forward, METH_VARARGS},
+    {"integrate_ab4_backward", integrate_ab4_backward, METH_VARARGS},
     {NULL, NULL} /* Marks the end of this structure */
 };
 
@@ -473,41 +475,54 @@ static PyObject *eval_fit_batch_dydt(PyObject *self, PyObject *args) {
     /* fit_params_mode == 1: identity, x unchanged */
     /* fit_params_mode == -1: legacy path, x already transformed by Python */
 
+    /* Precompute offsets for x_powers indexing */
+    int i, j;
+    int offsets[7];
+    offsets[0] = 0;
+    for (j = 1; j < 7; j++) {
+        offsets[j] = q_max_bfOrder + 1 + (chi_max_bfOrder + 1) * (j - 1);
+    }
+
     /* Pre-compute x_powers once for all fits */
     double x_powers[q_max_bfOrder+1 + 6*(chi_max_bfOrder+1)];
-    int i, j, base_idx;
     for (i=0; i <= q_max_bfOrder; i++) {
         x_powers[i] = ipow(q_fit_offset + q_fit_slope * x_data[0], i);
     }
     for (i=0; i <= chi_max_bfOrder; i++) {
         for (j=1; j<7; j++) {
-            base_idx = q_max_bfOrder+1 + (chi_max_bfOrder+1)*(j-1);
-            x_powers[base_idx + i] = ipow(x_data[j], i);
+            x_powers[offsets[j] + i] = ipow(x_data[j], i);
         }
+    }
+
+    /* Pre-extract fit data pointers outside the hot loop */
+    long *all_bf_order_data[9];
+    double *all_coef_data[9];
+    int all_n[9];
+    int k;
+    for (k = 0; k < 9; k++) {
+        PyObject *fit_tuple = PyList_GET_ITEM(fit_list, k);
+        all_bf_order_data[k] = (long *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 0));
+        all_coef_data[k] = (double *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1));
+        all_n[k] = (int) PyArray_DIMS((PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1))[0];
     }
 
     /* Evaluate 9 fits into stack array */
     double results[9];
-    int k, n;
-    for (k=0; k<9; k++) {
-        PyObject *fit_tuple = PyList_GET_ITEM(fit_list, k);
-        PyArrayObject *bf_orders = (PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 0);
-        PyArrayObject *coefs_arr = (PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1);
-
-        long *bf_order_data = (long *) PyArray_DATA(bf_orders);
-        double *coef_data   = (double *) PyArray_DATA(coefs_arr);
-        n = (int) PyArray_DIMS(coefs_arr)[0];
+    for (k = 0; k < 9; k++) {
+        long *bf_order_data = all_bf_order_data[k];
+        double *coef_data = all_coef_data[k];
+        int n = all_n[k];
 
         double res = 0.0;
-        long *orders;
-        double prod;
-        for (i=0; i<n; i++) {
-            orders = bf_order_data + i*7;
-            prod = x_powers[orders[0]];
-            for (j=1; j<7; j++) {
-                base_idx = q_max_bfOrder+1 + (chi_max_bfOrder+1)*(j-1);
-                prod *= x_powers[base_idx + orders[j]];
-            }
+        for (i = 0; i < n; i++) {
+            long *orders = bf_order_data + i * 7;
+            double prod = x_powers[orders[0]]
+                * x_powers[offsets[1] + orders[1]]
+                * x_powers[offsets[2] + orders[2]]
+                * x_powers[offsets[3] + orders[3]]
+                * x_powers[offsets[4] + orders[4]]
+                * x_powers[offsets[5] + orders[5]]
+                * x_powers[offsets[6] + orders[6]];
             res += coef_data[i] * prod;
         }
         results[k] = res;
@@ -681,6 +696,382 @@ static PyObject *ab4_dy(PyObject *self, PyObject *args) {
 
     // Sum up contributions
     return PyArray_Return(res);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Static helpers for fused AB4 integration (no Python allocations)   */
+/* ------------------------------------------------------------------ */
+
+/* get_ds_fit_x logic: writes 7 doubles into x_out */
+static void compute_fit_x(const double *y, double q, double *x_out) {
+    double sp = sin(y[4]);
+    double cp = cos(y[4]);
+    x_out[0] = q;
+    x_out[1] = y[5]*cp + y[6]*sp;
+    x_out[2] = -y[5]*sp + y[6]*cp;
+    x_out[3] = y[7];
+    x_out[4] = y[8]*cp + y[9]*sp;
+    x_out[5] = -y[8]*sp + y[9]*cp;
+    x_out[6] = y[10];
+}
+
+/* eval_fit_batch_dydt core: evaluate 9 fits + assemble dydt → writes 11 doubles into dydt_out */
+static void compute_dydt_core(
+    long **all_bf_order_data, double **all_coef_data, int *all_n,
+    double *x, const double *y,
+    double q_fit_offset, double q_fit_slope,
+    int q_max_bfOrder, int chi_max_bfOrder,
+    const double *q_consts, int fit_params_mode,
+    double *dydt_out)
+{
+    int i, j, k;
+
+    /* Apply fit_params transform if requested */
+    if (fit_params_mode == 0 && q_consts != NULL) {
+        double chi1z = x[3], chi2z = x[6];
+        x[0] = q_consts[0];
+        double chi_wtAvg = q_consts[1]*chi1z + q_consts[2]*chi2z;
+        x[3] = (chi_wtAvg - q_consts[3]*(chi1z + chi2z)) / q_consts[4];
+        x[6] = (chi1z - chi2z) * 0.5;
+    }
+
+    /* Precompute offsets */
+    int offsets[7];
+    offsets[0] = 0;
+    for (j = 1; j < 7; j++) {
+        offsets[j] = q_max_bfOrder + 1 + (chi_max_bfOrder + 1) * (j - 1);
+    }
+
+    /* Pre-compute x_powers */
+    double x_powers[q_max_bfOrder+1 + 6*(chi_max_bfOrder+1)];
+    for (i = 0; i <= q_max_bfOrder; i++) {
+        x_powers[i] = ipow(q_fit_offset + q_fit_slope * x[0], i);
+    }
+    for (j = 1; j < 7; j++) {
+      for (i = 0; i <= chi_max_bfOrder; i++) {
+        x_powers[offsets[j] + i] = ipow(x[j], i);
+      }
+    }
+
+    /* Evaluate 9 fits */
+    double results[9];
+    for (k = 0; k < 9; k++) {
+        long *bf_order_data = all_bf_order_data[k];
+        double *coef_data = all_coef_data[k];
+        int n = all_n[k];
+
+        double res = 0.0;
+        for (i = 0; i < n; i++) {
+            long *orders = bf_order_data + i * 7;
+            double prod = x_powers[orders[0]]
+                * x_powers[offsets[1] + orders[1]]
+                * x_powers[offsets[2] + orders[2]]
+                * x_powers[offsets[3] + orders[3]]
+                * x_powers[offsets[4] + orders[4]]
+                * x_powers[offsets[5] + orders[5]]
+                * x_powers[offsets[6] + orders[6]];
+            res += coef_data[i] * prod;
+        }
+        results[k] = res;
+    }
+
+    /* Assemble dydt */
+    double cp = cos(y[4]);
+    double sp = sin(y[4]);
+    double ooxy_x = results[0]*cp - results[1]*sp;
+    double ooxy_y = results[0]*sp + results[1]*cp;
+
+    dydt_out[0] = (-0.5)*y[1]*ooxy_x - 0.5*y[2]*ooxy_y;
+    dydt_out[1] = (-0.5)*y[3]*ooxy_y + 0.5*y[0]*ooxy_x;
+    dydt_out[2] = 0.5*y[3]*ooxy_x + 0.5*y[0]*ooxy_y;
+    dydt_out[3] = 0.5*y[1]*ooxy_y - 0.5*y[2]*ooxy_x;
+    dydt_out[4] = results[2];
+    dydt_out[5] = results[3]*cp - results[4]*sp;
+    dydt_out[6] = results[3]*sp + results[4]*cp;
+    dydt_out[7] = results[5];
+    dydt_out[8] = results[6]*cp - results[7]*sp;
+    dydt_out[9] = results[6]*sp + results[7]*cp;
+    dydt_out[10] = results[8];
+}
+
+/* ab4_dy logic: writes 11 doubles into dy_out */
+static void compute_ab4_dy(const double *k1, const double *k2, const double *k3, const double *k4,
+                           double dt1, double dt2, double dt3, double dt4, double *dy_out)
+{
+    double dt12 = dt1 + dt2;
+    double dt123 = dt12 + dt3;
+    double dt23 = dt2 + dt3;
+
+    double D1 = dt1 * dt12 * dt123;
+    double D2 = dt1 * dt2 * dt23;
+    double D3 = dt2 * dt12 * dt3;
+
+    double B41 = dt3 * dt23 / D1;
+    double B42 = -dt3 * dt123 / D2;
+    double B43 = dt23 * dt123 / D3;
+    double B4 = B41 + B42 + B43;
+
+    double C41 = (dt23 + dt3) / D1;
+    double C42 = -(dt123 + dt3) / D2;
+    double C43 = (dt123 + dt23) / D3;
+    double C4 = C41 + C42 + C43;
+
+    int i;
+    for (i = 0; i < 11; i++) {
+        double A = k4[i];
+        double B = k4[i]*B4 - k1[i]*B41 - k2[i]*B42 - k3[i]*B43;
+        double C = k4[i]*C4 - k1[i]*C41 - k2[i]*C42 - k3[i]*C43;
+        double D = (k4[i]-k1[i])/D1 - (k4[i]-k2[i])/D2 + (k4[i]-k3[i])/D3;
+        dy_out[i] = dt4 * (A + dt4 * (0.5*B + dt4*(C/3.0 + dt4*0.25*D)));
+    }
+}
+
+/* normalize_y logic: modifies y in-place */
+static void normalize_y_inplace(double *y, const double normA,
+                                const double normB) {
+    int i;
+    double sum = 0.0;
+    for (i = 0; i < 4; i++) {
+      sum += y[i]*y[i];
+    }
+    const double oneOverQuatNorm = 1.0 / sqrt(sum);
+
+    sum = 0.0;
+    for (i = 5; i < 8; i++) {
+      sum += y[i]*y[i];
+    }
+    const double oneOverNormA = 1.0 / sqrt(sum);
+
+    sum = 0.0;
+    for (i = 8; i < 11; i++) {
+      sum += y[i]*y[i];
+    }
+    const double oneOverNormB = 1.0 / sqrt(sum);
+
+    for (i = 0; i < 4; i++) {
+      y[i] *= oneOverQuatNorm;
+    }
+    /* y[4] unchanged (orbital phase) */
+    for (i = 5; i < 8; i++) {
+      y[i] *= normA * oneOverNormA;
+    }
+    for (i = 8; i < 11; i++) {
+      y[i] *= normB  * oneOverNormB;
+    }
+}
+
+/* Helper to extract fit data pointers from a Python list of 9 tuples */
+static int extract_fit_data(PyObject *fit_list,
+                            long **all_bf_order_data,
+                            double **all_coef_data,
+                            int *all_n)
+{
+    int k;
+    for (k = 0; k < 9; k++) {
+        PyObject *fit_tuple = PyList_GET_ITEM(fit_list, k);
+        all_bf_order_data[k] = (long *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 0));
+        all_coef_data[k] = (double *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1));
+        all_n[k] = (int) PyArray_DIMS((PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1))[0];
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Fused AB4 forward integration                                      */
+/* ------------------------------------------------------------------ */
+static PyObject *integrate_ab4_forward(PyObject *self, PyObject *args) {
+    PyObject *fit_data_batch;
+    PyArrayObject *y_of_t_arr, *k1_arr, *k2_arr, *k3_arr, *diff_t_arr;
+    PyArrayObject *q_consts_arr = NULL;
+    double q, normA, normB;
+    int i0;
+    double dt1, dt2, dt3;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+    int fit_params_mode = -1;
+
+    if (!PyArg_ParseTuple(args, "OO!dddiO!O!O!dddO!ddii|O!i",
+            &fit_data_batch,
+            &PyArray_Type, &y_of_t_arr,
+            &q, &normA, &normB,
+            &i0,
+            &PyArray_Type, &k1_arr,
+            &PyArray_Type, &k2_arr,
+            &PyArray_Type, &k3_arr,
+            &dt1, &dt2, &dt3,
+            &PyArray_Type, &diff_t_arr,
+            &q_fit_offset, &q_fit_slope,
+            &q_max_bfOrder, &chi_max_bfOrder,
+            &PyArray_Type, &q_consts_arr,
+            &fit_params_mode)) return NULL;
+
+    double *y_of_t = (double *) PyArray_DATA(y_of_t_arr);
+    double *diff_t = (double *) PyArray_DATA(diff_t_arr);
+    int n_diff_t = (int) PyArray_DIMS(diff_t_arr)[0];
+    int n_steps = n_diff_t - (i0 + 3);  /* matches Python: diff_t[i0+3:] */
+
+    double *q_consts = q_consts_arr ? (double *) PyArray_DATA(q_consts_arr) : NULL;
+
+    /* Copy initial k values to local buffers */
+    double lk1[11], lk2[11], lk3[11], lk4[11];
+    double x[7], dy[11];
+    memcpy(lk1, PyArray_DATA(k1_arr), 11*sizeof(double));
+    memcpy(lk2, PyArray_DATA(k2_arr), 11*sizeof(double));
+    memcpy(lk3, PyArray_DATA(k3_arr), 11*sizeof(double));
+
+    int i;
+    for (i = 0; i < n_steps; i++) {
+        int i_output = i0 + i;
+        int node_index = i_output + 3;
+        double dt4 = diff_t[i0 + 3 + i];
+        double *y_cur = y_of_t + i_output * 11;
+        double *y_next = y_of_t + (i_output + 1) * 11;
+
+        /* Extract packed fit data for this node and set up pointer arrays */
+        PyObject *node_data = PyList_GET_ITEM(fit_data_batch, node_index);
+        long *pk_orders = (long *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(node_data, 0));
+        double *pk_coefs = (double *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(node_data, 1));
+        int N = (int) PyLong_AsLong(PyTuple_GET_ITEM(node_data, 2));
+        int *ns = (int *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(node_data, 3));
+
+        long *all_bf_order_data[9];
+        double *all_coef_data[9];
+        int all_n[9];
+        { int kk; for (kk = 0; kk < 9; kk++) {
+            all_bf_order_data[kk] = pk_orders + kk * N * 7;
+            all_coef_data[kk] = pk_coefs + kk * N;
+            all_n[kk] = ns[kk];
+        }}
+
+        /* compute_fit_x */
+        compute_fit_x(y_cur, q, x);
+
+        /* compute_dydt_core → k4 */
+        compute_dydt_core(all_bf_order_data, all_coef_data, all_n,
+                          x, y_cur,
+                          q_fit_offset, q_fit_slope,
+                          q_max_bfOrder, chi_max_bfOrder,
+                          q_consts, fit_params_mode, lk4);
+
+        /* compute_ab4_dy → dy */
+        compute_ab4_dy(lk1, lk2, lk3, lk4, dt1, dt2, dt3, dt4, dy);
+
+        /* y_next = y_cur + dy */
+        int j;
+        for (j = 0; j < 11; j++) {
+            y_next[j] = y_cur[j] + dy[j];
+        }
+
+        /* normalize in-place */
+        normalize_y_inplace(y_next, normA, normB);
+
+        /* shift */
+        memcpy(lk1, lk2, 11*sizeof(double));
+        memcpy(lk2, lk3, 11*sizeof(double));
+        memcpy(lk3, lk4, 11*sizeof(double));
+        dt1 = dt2; dt2 = dt3; dt3 = dt4;
+    }
+
+    Py_RETURN_NONE;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Fused AB4 backward integration                                     */
+/* ------------------------------------------------------------------ */
+static PyObject *integrate_ab4_backward(PyObject *self, PyObject *args) {
+    PyObject *fit_data_batch;
+    PyArrayObject *y_of_t_arr, *k1_arr, *k2_arr, *k3_arr, *dt_array_arr;
+    PyArrayObject *q_consts_arr = NULL;
+    double q, normA, normB;
+    int i0;
+    double dt1, dt2, dt3;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+    int fit_params_mode = -1;
+
+    if (!PyArg_ParseTuple(args, "OO!dddiO!O!O!dddO!ddii|O!i",
+            &fit_data_batch,
+            &PyArray_Type, &y_of_t_arr,
+            &q, &normA, &normB,
+            &i0,
+            &PyArray_Type, &k1_arr,
+            &PyArray_Type, &k2_arr,
+            &PyArray_Type, &k3_arr,
+            &dt1, &dt2, &dt3,
+            &PyArray_Type, &dt_array_arr,
+            &q_fit_offset, &q_fit_slope,
+            &q_max_bfOrder, &chi_max_bfOrder,
+            &PyArray_Type, &q_consts_arr,
+            &fit_params_mode)) return NULL;
+
+    double *y_of_t = (double *) PyArray_DATA(y_of_t_arr);
+    double *dt_array = (double *) PyArray_DATA(dt_array_arr);
+
+    double *q_consts = q_consts_arr ? (double *) PyArray_DATA(q_consts_arr) : NULL;
+
+    /* Copy initial k values to local buffers */
+    double lk1[11], lk2[11], lk3[11], lk4[11];
+    double x[7], dy[11];
+    memcpy(lk1, PyArray_DATA(k1_arr), 11*sizeof(double));
+    memcpy(lk2, PyArray_DATA(k2_arr), 11*sizeof(double));
+    memcpy(lk3, PyArray_DATA(k3_arr), 11*sizeof(double));
+
+    int i_output;
+    for (i_output = i0 - 1; i_output >= 0; i_output--) {
+        int node_index = i_output + 4;
+        if (i_output < 2) {
+            node_index = 2 + 2*i_output;
+        }
+        double dt4 = dt_array[i_output];
+        double *y_next = y_of_t + (i_output + 1) * 11;  /* the "later" row */
+        double *y_cur = y_of_t + i_output * 11;          /* where we write */
+
+        /* Extract packed fit data for this node and set up pointer arrays */
+        PyObject *node_data = PyList_GET_ITEM(fit_data_batch, node_index);
+        long *pk_orders = (long *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(node_data, 0));
+        double *pk_coefs = (double *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(node_data, 1));
+        int N = (int) PyLong_AsLong(PyTuple_GET_ITEM(node_data, 2));
+        int *ns = (int *) PyArray_DATA((PyArrayObject *) PyTuple_GET_ITEM(node_data, 3));
+
+        long *all_bf_order_data[9];
+        double *all_coef_data[9];
+        int all_n[9];
+        { int kk; for (kk = 0; kk < 9; kk++) {
+            all_bf_order_data[kk] = pk_orders + kk * N * 7;
+            all_coef_data[kk] = pk_coefs + kk * N;
+            all_n[kk] = ns[kk];
+        }}
+
+        /* compute_fit_x from y[i_output+1] */
+        compute_fit_x(y_next, q, x);
+
+        /* compute_dydt_core → k4 */
+        compute_dydt_core(all_bf_order_data, all_coef_data, all_n,
+                          x, y_next,
+                          q_fit_offset, q_fit_slope,
+                          q_max_bfOrder, chi_max_bfOrder,
+                          q_consts, fit_params_mode, lk4);
+
+        /* compute_ab4_dy → dy */
+        compute_ab4_dy(lk1, lk2, lk3, lk4, dt1, dt2, dt3, dt4, dy);
+
+        /* y_cur = y_next - dy */
+        int j;
+        for (j = 0; j < 11; j++) {
+            y_cur[j] = y_next[j] - dy[j];
+        }
+
+        /* normalize in-place */
+        normalize_y_inplace(y_cur, normA, normB);
+
+        /* shift */
+        memcpy(lk1, lk2, 11*sizeof(double));
+        memcpy(lk2, lk3, 11*sizeof(double));
+        memcpy(lk3, lk4, 11*sizeof(double));
+        dt1 = dt2; dt2 = dt3; dt3 = dt4;
+    }
+
+    Py_RETURN_NONE;
 }
 
 double factorial(int n) {
