@@ -1,5 +1,5 @@
 import ctypes
-from ctypes import c_double, c_long, POINTER, c_int
+from ctypes import c_double, c_long, POINTER, c_int, c_void_p
 import numpy as np
 import os
 from glob import glob
@@ -26,22 +26,22 @@ elif len(spline_libs) > 1:
 else:
   c_interp = _load_c_func(spline_libs[0], 'spline_interp', [
       c_long, c_long,
-      POINTER(c_double), POINTER(c_double),
-      POINTER(c_double), POINTER(c_double),
+      c_void_p, c_void_p,
+      c_void_p, c_void_p,
   ], restype=c_int)
   c_interp_multi = _load_c_func(spline_libs[0], 'spline_interp_multi', [
       c_long, c_long, c_long,
-      POINTER(c_double),
-      POINTER(POINTER(c_double)),
-      POINTER(c_double),
-      POINTER(POINTER(c_double)),
+      c_void_p,
+      c_void_p,
+      c_void_p,
+      c_void_p,
   ], restype=c_int)
   c_interp_multi_complex = _load_c_func(spline_libs[0], 'spline_interp_multi_complex', [
       c_long, c_long, c_long,
-      POINTER(c_double),          # data_x
-      POINTER(POINTER(c_double)), # data_y (interleaved re,im)
-      POINTER(c_double),          # out_x
-      POINTER(POINTER(c_double)), # out_y  (interleaved re,im)
+      c_void_p,
+      c_void_p,
+      c_void_p,
+      c_void_p,
   ], restype=c_int)
 
 _SPLINE_ERRORS = {
@@ -63,12 +63,12 @@ def interpolate(xnew, x, y):
     y = y.astype('float64')
     xnew = xnew.astype('float64', copy=False)
 
-    x_p = x.ctypes.data_as(POINTER(c_double))
-    y_p = y.ctypes.data_as(POINTER(c_double))
-    xnew_p = xnew.ctypes.data_as(POINTER(c_double))
+    x_p = x.ctypes.data
+    y_p = y.ctypes.data
+    xnew_p = xnew.ctypes.data
 
     ynew  = np.empty(xnew.shape[0])
-    ynew_p = ynew.ctypes.data_as(POINTER(c_double))
+    ynew_p = ynew.ctypes.data
 
     rc = c_interp(x.shape[0],xnew.shape[0],x_p,y_p,xnew_p,ynew_p)
     _check_spline_rc(rc)
@@ -110,8 +110,8 @@ def interpolate_many(xnew, x, y):
 
     num_datasets, n_x = y.shape
 
-    x_p = x.ctypes.data_as(POINTER(c_double))
-    xnew_p = xnew.ctypes.data_as(POINTER(c_double))
+    x_p = x.ctypes.data
+    xnew_p = xnew.ctypes.data
 
     ynew = np.empty((y.shape[0], xnew.shape[0]), dtype='float64')
 
@@ -119,11 +119,11 @@ def interpolate_many(xnew, x, y):
     row_bytes  = y.shape[1]    * y.itemsize
     out_bytes  = xnew.shape[0] * ynew.itemsize
 
-    PtrArr  = POINTER(c_double) * n_datasets
-    y_ptrs    = PtrArr(*(ctypes.cast(y.ctypes.data    + d * row_bytes,
-                                     POINTER(c_double)) for d in range(n_datasets)))
-    ynew_ptrs = PtrArr(*(ctypes.cast(ynew.ctypes.data + d * out_bytes,
-                                     POINTER(c_double)) for d in range(n_datasets)))
+    VoidPtrArr = c_void_p * n_datasets
+    y_base    = y.ctypes.data
+    ynew_base = ynew.ctypes.data
+    y_ptrs    = VoidPtrArr(*(y_base    + d * row_bytes for d in range(n_datasets)))
+    ynew_ptrs = VoidPtrArr(*(ynew_base + d * out_bytes for d in range(n_datasets)))
 
     rc = c_interp_multi(x.shape[0], xnew.shape[0], n_datasets, x_p, y_ptrs, xnew_p,
                         ynew_ptrs)
@@ -151,8 +151,8 @@ def interpolate_many_complex(xnew, x, y):
     n_datasets, n_x = y.shape
     n_out = xnew.shape[0]
 
-    x_p    = x.ctypes.data_as(POINTER(c_double))
-    xnew_p = xnew.ctypes.data_as(POINTER(c_double))
+    x_p    = x.ctypes.data
+    xnew_p = xnew.ctypes.data
 
     ynew = np.empty((n_datasets, n_out), dtype=np.complex128)
 
@@ -160,11 +160,11 @@ def interpolate_many_complex(xnew, x, y):
     row_bytes = n_x  * 16  # sizeof(complex128) = 16
     out_bytes = n_out * 16
 
-    PtrArr = POINTER(c_double) * n_datasets
-    y_ptrs    = PtrArr(*(ctypes.cast(y.ctypes.data    + d * row_bytes,
-                                     POINTER(c_double)) for d in range(n_datasets)))
-    ynew_ptrs = PtrArr(*(ctypes.cast(ynew.ctypes.data + d * out_bytes,
-                                     POINTER(c_double)) for d in range(n_datasets)))
+    VoidPtrArr = c_void_p * n_datasets
+    y_base    = y.ctypes.data
+    ynew_base = ynew.ctypes.data
+    y_ptrs    = VoidPtrArr(*(y_base    + d * row_bytes for d in range(n_datasets)))
+    ynew_ptrs = VoidPtrArr(*(ynew_base + d * out_bytes for d in range(n_datasets)))
 
     rc = c_interp_multi_complex(n_x, n_out, n_datasets, x_p, y_ptrs, xnew_p,
                                 ynew_ptrs)
