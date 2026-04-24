@@ -598,7 +598,14 @@ the nearest time node.
             times = np.append(self.t[:6:2], self.t[6:])
             i0 = np.argmin(abs(times - t_ref))
             t0 = times[i0]
-            dydt0 = self.get_time_deriv(t_ref, q, y0)
+            if self._fit_params_mode >= 0:
+                dydt0 = _utils._compute_dydt_interp(
+                    t_ref, y0, q,
+                    self.packed_fit_data, self.t,
+                    *self._fit_settings,
+                    self._q_consts, self._fit_params_mode)
+            else:
+                dydt0 = self.get_time_deriv(t_ref, q, y0)
             y_node = y0 + (t0 - t_ref) * dydt0
             y_node = _utils.normalize_y(y_node, normA, normB)
             data[i0, :] = y_node
@@ -626,8 +633,15 @@ the nearest time node.
     def _one_forward_RK4_step(self, q, y_of_t, normA, normB, i0):
         """Steps forward one step using RK4"""
 
-        # i0 is on the y_of_t grid, which has 3 fewer samples than the
-        # self.t grid
+        if self._fit_params_mode >= 0:
+            k1 = _utils.rk4_step_forward(
+                self.packed_fit_data, y_of_t, q, normA, normB, i0,
+                self.t,
+                *self._fit_settings,
+                self._q_consts, self._fit_params_mode)
+            return y_of_t, k1
+
+        # Legacy path: Python interpolation
         i_t = i0 + 3
         if i0 < 3:
             i_t = i0*2
@@ -649,8 +663,15 @@ the nearest time node.
     def _one_backward_RK4_step(self, q, y_of_t, normA, normB, i0):
         """Steps backward one step using RK4"""
 
-        # i0 is on the y_of_t grid, which has 3 fewer samples than the
-        # self.t grid
+        if self._fit_params_mode >= 0:
+            k1 = _utils.rk4_step_backward(
+                self.packed_fit_data, y_of_t, q, normA, normB, i0,
+                self.t,
+                *self._fit_settings,
+                self._q_consts, self._fit_params_mode)
+            return y_of_t, k1
+
+        # Legacy path: Python interpolation
         i_t = i0 + 3
         if i0 < 3:
             i_t = i0*2

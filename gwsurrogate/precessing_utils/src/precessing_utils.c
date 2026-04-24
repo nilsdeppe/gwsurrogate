@@ -58,6 +58,10 @@ static struct module_state _state;
 /* Forward declarations */
 static PyObject *py_rotate_waveform(PyObject *self, PyObject *args);
 static PyObject *eval_coorb_modes(PyObject *self, PyObject *args);
+static PyObject *py_lagrange4_interp(PyObject *self, PyObject *args);
+static PyObject *py_compute_dydt_interp(PyObject *self, PyObject *args);
+static PyObject *rk4_step_forward(PyObject *self, PyObject *args);
+static PyObject *rk4_step_backward(PyObject *self, PyObject *args);
 
 /* ==== Setup the python methods table === */
 static PyMethodDef _utils_methods[] = {
@@ -75,6 +79,10 @@ static PyMethodDef _utils_methods[] = {
     {"eval_coorb_modes", eval_coorb_modes, METH_VARARGS},
     {"integrate_ab4_forward", integrate_ab4_forward, METH_VARARGS},
     {"integrate_ab4_backward", integrate_ab4_backward, METH_VARARGS},
+    {"_lagrange4_interp", py_lagrange4_interp, METH_VARARGS},
+    {"_compute_dydt_interp", py_compute_dydt_interp, METH_VARARGS},
+    {"rk4_step_forward", rk4_step_forward, METH_VARARGS},
+    {"rk4_step_backward", rk4_step_backward, METH_VARARGS},
     {NULL, NULL} /* Marks the end of this structure */
 };
 
@@ -874,6 +882,332 @@ static int extract_fit_data(PyObject *fit_list,
         all_n[k] = (int) PyArray_DIMS((PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1))[0];
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Cubic Lagrange interpolation over 4 knots                          */
+/* ------------------------------------------------------------------ */
+static double lagrange4_interp(double t, const double ts[4],
+                               const double vals[4]) {
+    double result = 0.0;
+    int i, j;
+    for (i = 0; i < 4; i++) {
+        double basis = vals[i];
+        for (j = 0; j < 4; j++) {
+            if (j != i) {
+                basis *= (t - ts[j]) / (ts[i] - ts[j]);
+            }
+        }
+        result += basis;
+    }
+    return result;
+}
+
+/* Python-callable wrapper for testing */
+static PyObject *py_lagrange4_interp(PyObject *self, PyObject *args) {
+    double t;
+    PyArrayObject *ts_arr, *vals_arr;
+    if (!PyArg_ParseTuple(args, "dO!O!",
+            &t,
+            &PyArray_Type, &ts_arr,
+            &PyArray_Type, &vals_arr)) return NULL;
+    double *ts = (double *) PyArray_DATA(ts_arr);
+    double *vals = (double *) PyArray_DATA(vals_arr);
+    double result = lagrange4_interp(t, ts, vals);
+    return Py_BuildValue("d", result);
+}
+
+/* ------------------------------------------------------------------ */
+/*  compute_dydt_interp: evaluate dydt at arbitrary time t via         */
+/*  Lagrange interpolation of dydt at 4 nearest nodes                  */
+/* ------------------------------------------------------------------ */
+static void compute_dydt_interp(
+    double t, const double *y, double q,
+    PyObject *fit_data_batch, const double *t_array, int n_t,
+    double q_fit_offset, double q_fit_slope,
+    int q_max_bfOrder, int chi_max_bfOrder,
+    const double *q_consts, int fit_params_mode,
+    double *dydt_out)
+{
+    /* Find imin: the starting index of the 4-node bracket */
+    int i0_best = 0;
+    double min_dist = fabs(t_array[0] - t);
+    int i;
+    for (i = 1; i < n_t; i++) {
+        double d = fabs(t_array[i] - t);
+        if (d < min_dist) {
+            min_dist = d;
+            i0_best = i;
+        }
+    }
+    int imin;
+    if (t > t_array[i0_best]) {
+        imin = i0_best - 1;
+    } else {
+        imin = i0_best - 2;
+    }
+    if (imin < 0) imin = 0;
+    if (imin > n_t - 4) imin = n_t - 4;
+
+    /* Evaluate dydt at the 4 nodes */
+    double dydts[4][11];
+    double ts[4];
+    int ni;
+    for (ni = 0; ni < 4; ni++) {
+        int node_index = imin + ni;
+        ts[ni] = t_array[node_index];
+
+        /* Extract packed fit data for this node */
+        PyObject *node_data = PyList_GET_ITEM(fit_data_batch, node_index);
+        long *pk_orders = (long *) PyArray_DATA(
+            (PyArrayObject *) PyTuple_GET_ITEM(node_data, 0));
+        double *pk_coefs = (double *) PyArray_DATA(
+            (PyArrayObject *) PyTuple_GET_ITEM(node_data, 1));
+        int N = (int) PyLong_AsLong(PyTuple_GET_ITEM(node_data, 2));
+        int *ns = (int *) PyArray_DATA(
+            (PyArrayObject *) PyTuple_GET_ITEM(node_data, 3));
+
+        long *all_bf_order_data[9];
+        double *all_coef_data[9];
+        int all_n[9];
+        int kk;
+        for (kk = 0; kk < 9; kk++) {
+            all_bf_order_data[kk] = pk_orders + kk * N * 7;
+            all_coef_data[kk] = pk_coefs + kk * N;
+            all_n[kk] = ns[kk];
+        }
+
+        double x[7];
+        compute_fit_x(y, q, x);
+        compute_dydt_core(all_bf_order_data, all_coef_data, all_n,
+                          x, y,
+                          q_fit_offset, q_fit_slope,
+                          q_max_bfOrder, chi_max_bfOrder,
+                          q_consts, fit_params_mode,
+                          dydts[ni]);
+    }
+
+    /* Lagrange interpolate each of 11 components */
+    int c;
+    for (c = 0; c < 11; c++) {
+        double vals[4] = {dydts[0][c], dydts[1][c], dydts[2][c], dydts[3][c]};
+        dydt_out[c] = lagrange4_interp(t, ts, vals);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  RK4 step forward: one step from i0 to i0+1                        */
+/* ------------------------------------------------------------------ */
+static PyObject *rk4_step_forward(PyObject *self, PyObject *args) {
+    PyObject *fit_data_batch;
+    PyArrayObject *y_of_t_arr, *t_array_arr;
+    PyArrayObject *q_consts_arr = NULL;
+    double q, normA, normB;
+    int i0;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+    int fit_params_mode = -1;
+
+    if (!PyArg_ParseTuple(args, "OO!dddiO!ddii|O!i",
+            &fit_data_batch,
+            &PyArray_Type, &y_of_t_arr,
+            &q, &normA, &normB,
+            &i0,
+            &PyArray_Type, &t_array_arr,
+            &q_fit_offset, &q_fit_slope,
+            &q_max_bfOrder, &chi_max_bfOrder,
+            &PyArray_Type, &q_consts_arr,
+            &fit_params_mode)) return NULL;
+
+    double *y_of_t = (double *) PyArray_DATA(y_of_t_arr);
+    double *t_array = (double *) PyArray_DATA(t_array_arr);
+    int n_t = (int) PyArray_DIMS(t_array_arr)[0];
+    double *q_consts = q_consts_arr ? (double *) PyArray_DATA(q_consts_arr) : NULL;
+
+    /* Map i0 (y_of_t index) to t index */
+    int i_t = i0 + 3;
+    if (i0 < 3) i_t = i0 * 2;
+
+    double t1 = t_array[i_t];
+    double t2 = t_array[i_t + 1];
+    if (i0 < 3) t2 = t_array[i_t + 2];
+    double half_dt = 0.5 * (t2 - t1);
+
+    double *y_cur = y_of_t + i0 * 11;
+    double k1[11], k2[11], k3[11], k4[11];
+    double y_tmp[11];
+    int j;
+
+    /* k1 = f(t1, y_cur) */
+    compute_dydt_interp(t1, y_cur, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, k1);
+
+    /* k2 = f(t1 + half_dt, y_cur + half_dt*k1) */
+    for (j = 0; j < 11; j++) y_tmp[j] = y_cur[j] + half_dt * k1[j];
+    compute_dydt_interp(t1 + half_dt, y_tmp, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, k2);
+
+    /* k3 = f(t1 + half_dt, y_cur + half_dt*k2) */
+    for (j = 0; j < 11; j++) y_tmp[j] = y_cur[j] + half_dt * k2[j];
+    compute_dydt_interp(t1 + half_dt, y_tmp, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, k3);
+
+    /* k4 = f(t2, y_cur + 2*half_dt*k3) */
+    for (j = 0; j < 11; j++) y_tmp[j] = y_cur[j] + 2.0 * half_dt * k3[j];
+    compute_dydt_interp(t2, y_tmp, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, k4);
+
+    /* y_{n+1} = y_n + (half_dt/3)(k1 + 2k2 + 2k3 + k4) */
+    double *y_next = y_of_t + (i0 + 1) * 11;
+    double coeff = half_dt / 3.0;
+    for (j = 0; j < 11; j++) {
+        y_next[j] = y_cur[j] + coeff * (k1[j] + 2*k2[j] + 2*k3[j] + k4[j]);
+    }
+    normalize_y_inplace(y_next, normA, normB);
+
+    /* Return k1 as numpy array (needed for AB4 history) */
+    npy_intp dims[1] = {11};
+    PyArrayObject *k1_out = (PyArrayObject *) PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (!k1_out) return NULL;
+    memcpy(PyArray_DATA(k1_out), k1, 11 * sizeof(double));
+
+    return PyArray_Return(k1_out);
+}
+
+/* ------------------------------------------------------------------ */
+/*  RK4 step backward: one step from i0 to i0-1                       */
+/* ------------------------------------------------------------------ */
+static PyObject *rk4_step_backward(PyObject *self, PyObject *args) {
+    PyObject *fit_data_batch;
+    PyArrayObject *y_of_t_arr, *t_array_arr;
+    PyArrayObject *q_consts_arr = NULL;
+    double q, normA, normB;
+    int i0;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+    int fit_params_mode = -1;
+
+    if (!PyArg_ParseTuple(args, "OO!dddiO!ddii|O!i",
+            &fit_data_batch,
+            &PyArray_Type, &y_of_t_arr,
+            &q, &normA, &normB,
+            &i0,
+            &PyArray_Type, &t_array_arr,
+            &q_fit_offset, &q_fit_slope,
+            &q_max_bfOrder, &chi_max_bfOrder,
+            &PyArray_Type, &q_consts_arr,
+            &fit_params_mode)) return NULL;
+
+    double *y_of_t = (double *) PyArray_DATA(y_of_t_arr);
+    double *t_array = (double *) PyArray_DATA(t_array_arr);
+    int n_t = (int) PyArray_DIMS(t_array_arr)[0];
+    double *q_consts = q_consts_arr ? (double *) PyArray_DATA(q_consts_arr) : NULL;
+
+    /* Map i0 (y_of_t index) to t index */
+    int i_t = i0 + 3;
+    if (i0 < 3) i_t = i0 * 2;
+
+    double t1 = t_array[i_t];
+    double t2 = t_array[i_t - 1];
+    if (i0 <= 3) t2 = t_array[i_t - 2];
+    double half_dt = 0.5 * (t2 - t1);
+
+    double *y_cur = y_of_t + i0 * 11;
+    double k1[11], k2[11], k3[11], k4[11];
+    double y_tmp[11];
+    int j;
+
+    /* k1 = f(t1, y_cur) */
+    compute_dydt_interp(t1, y_cur, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, k1);
+
+    /* k2 = f(t1 + half_dt, y_cur + half_dt*k1) */
+    for (j = 0; j < 11; j++) y_tmp[j] = y_cur[j] + half_dt * k1[j];
+    compute_dydt_interp(t1 + half_dt, y_tmp, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, k2);
+
+    /* k3 = f(t1 + half_dt, y_cur + half_dt*k2) */
+    for (j = 0; j < 11; j++) y_tmp[j] = y_cur[j] + half_dt * k2[j];
+    compute_dydt_interp(t1 + half_dt, y_tmp, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, k3);
+
+    /* k4 = f(t2, y_cur + 2*half_dt*k3) */
+    for (j = 0; j < 11; j++) y_tmp[j] = y_cur[j] + 2.0 * half_dt * k3[j];
+    compute_dydt_interp(t2, y_tmp, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, k4);
+
+    /* y_{n-1} = y_n + (half_dt/3)(k1 + 2k2 + 2k3 + k4) */
+    double *y_prev = y_of_t + (i0 - 1) * 11;
+    double coeff = half_dt / 3.0;
+    for (j = 0; j < 11; j++) {
+        y_prev[j] = y_cur[j] + coeff * (k1[j] + 2*k2[j] + 2*k3[j] + k4[j]);
+    }
+    normalize_y_inplace(y_prev, normA, normB);
+
+    /* Return k1 as numpy array (needed for AB4 history) */
+    npy_intp dims[1] = {11};
+    PyArrayObject *k1_out = (PyArrayObject *) PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (!k1_out) return NULL;
+    memcpy(PyArray_DATA(k1_out), k1, 11 * sizeof(double));
+
+    return PyArray_Return(k1_out);
+}
+
+/* ------------------------------------------------------------------ */
+/*  compute_dydt_interp: Python-callable wrapper for testing           */
+/* ------------------------------------------------------------------ */
+static PyObject *py_compute_dydt_interp(PyObject *self, PyObject *args) {
+    double t, q;
+    PyArrayObject *y_arr, *t_array_arr;
+    PyObject *fit_data_batch;
+    PyArrayObject *q_consts_arr = NULL;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+    int fit_params_mode = -1;
+
+    if (!PyArg_ParseTuple(args, "dO!dOO!ddii|O!i",
+            &t,
+            &PyArray_Type, &y_arr,
+            &q,
+            &fit_data_batch,
+            &PyArray_Type, &t_array_arr,
+            &q_fit_offset, &q_fit_slope,
+            &q_max_bfOrder, &chi_max_bfOrder,
+            &PyArray_Type, &q_consts_arr,
+            &fit_params_mode)) return NULL;
+
+    double *y = (double *) PyArray_DATA(y_arr);
+    double *t_array = (double *) PyArray_DATA(t_array_arr);
+    int n_t = (int) PyArray_DIMS(t_array_arr)[0];
+    double *q_consts = q_consts_arr ? (double *) PyArray_DATA(q_consts_arr) : NULL;
+
+    double dydt_out[11];
+    compute_dydt_interp(t, y, q, fit_data_batch, t_array, n_t,
+                        q_fit_offset, q_fit_slope,
+                        q_max_bfOrder, chi_max_bfOrder,
+                        q_consts, fit_params_mode, dydt_out);
+
+    npy_intp dims[1] = {11};
+    PyArrayObject *result = (PyArrayObject *) PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (!result) return NULL;
+    memcpy(PyArray_DATA(result), dydt_out, 11 * sizeof(double));
+    return PyArray_Return(result);
 }
 
 /* ------------------------------------------------------------------ */
