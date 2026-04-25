@@ -38,7 +38,7 @@ def _wignerD_matrices_python(q, ellMax):
 
     for i, ell in enumerate(lvals):
         for m in range(-ell, ell + 1):
-            if (ell + m) % 2 == 1:
+            if (ell + m) % 2 == 0:
                 matrices[i][ell + m, ell - m, i2] = rb[i2] ** (2 * m)
             else:
                 matrices[i][ell + m, ell - m, i2] = -1 * rb[i2] ** (2 * m)
@@ -223,3 +223,47 @@ def test_wignerD_invalid_q_shape():
     """q with wrong shape should raise ValueError."""
     with pytest.raises(ValueError):
         _wignerD_matrices(np.ones((3, 5)), ellMax=2)
+
+
+def test_wignerD_edge_a_analytic():
+    """Edge-a (ra=0): D^ell_{m,-m} = (-1)^{ell+m} * rb^{2m}, others zero."""
+    ellMax = 4
+    # q = [0, 1/sqrt(2), 1/sqrt(2), 0] → ra=0, rb = q2 + i*q1 = 1/sqrt(2) + i/sqrt(2)
+    q = np.array([[0.0], [1.0 / np.sqrt(2)], [1.0 / np.sqrt(2)], [0.0]])
+    rb = q[2, 0] + 1j * q[1, 0]
+
+    mats = _wignerD_matrices(q, ellMax)
+    for i, ell in enumerate(range(2, ellMax + 1)):
+        D = mats[i][:, :, 0]
+        size = 2 * ell + 1
+        expected = np.zeros((size, size), dtype=complex)
+        for m in range(-ell, ell + 1):
+            sign = (-1) ** (ell + m)
+            row = ell + m
+            col = ell - m
+            expected[row, col] = sign * rb ** (2 * m)
+        np.testing.assert_allclose(
+            D, expected, atol=1e-12,
+            err_msg=f"ell={ell}: edge-a D-matrix doesn't match analytic formula",
+        )
+
+
+def test_wignerD_edge_cases_match_python_reference():
+    """C implementation matches Python reference including edge-a/b quaternions."""
+    ellMax = 4
+    # Edge-a: ra = 0
+    q_edge_a = np.array([[0.0], [1.0 / np.sqrt(2)], [1.0 / np.sqrt(2)], [0.0]])
+    # Edge-b: rb = 0
+    q_edge_b = np.array([[1.0 / np.sqrt(2)], [0.0], [0.0], [1.0 / np.sqrt(2)]])
+    # Generic quaternions
+    q_generic = _random_unit_quaternions(6)
+    q = np.hstack([q_edge_a, q_edge_b, q_generic])
+
+    mats_c = _wignerD_matrices(q, ellMax)
+    mats_py = _wignerD_matrices_python(q, ellMax)
+
+    for i, ell in enumerate(range(2, ellMax + 1)):
+        np.testing.assert_allclose(
+            mats_c[i], mats_py[i], atol=1e-12,
+            err_msg=f"ell={ell}: C result disagrees with Python reference (incl. edge cases)",
+        )

@@ -1565,6 +1565,24 @@ static void build_unit_pows(const double complex *unit,
     }
 }
 
+/* Variant: rows 0, +1, -1 are already seeded; extend from p=2..half */
+static void build_unit_pows_from_seed(size_t len, int half,
+                                      double complex *out)
+{
+    for (int p = 2; p <= half; ++p) {
+        size_t c = (size_t)(half + p) * len, pv = c - len;
+        size_t d = (size_t)(half - p) * len, dv = d + len;
+        /* power +p = power+(p-1) * power+1 */
+        size_t u1 = (size_t)(half + 1) * len;
+        /* power -p = power-(p-1) * power-1 */
+        size_t u1_inv = (size_t)(half - 1) * len;
+        for (size_t k = 0; k < len; ++k) {
+            out[c + k] = out[pv + k] * out[u1 + k];
+            out[d + k] = out[dv + k] * out[u1_inv + k];
+        }
+    }
+}
+
 /* ================================================================== */
 /*  Three-term recurrence coefficients for Wigner d-matrix            */
 /*  d^ell_{m,mp} = (A*cos(beta)*d^{ell-1} + B*d^{ell-2}) / C        */
@@ -1841,12 +1859,6 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
 
     /* General-case branch (rewind, may overlap edge-case region) */
     bump_sizer_restore(&S, saved_S);
-    BUMP_NEED(S, double complex, n);                /* ua */
-    BUMP_NEED(S, double complex, n);                /* ub */
-    BUMP_NEED(S, double complex, n);                /* ua_inv */
-    BUMP_NEED(S, double complex, n);                /* ub_inv */
-    BUMP_NEED(S, double, n);                        /* c2 */
-    BUMP_NEED(S, double, n);                        /* s2 */
     BUMP_NEED(S, double, n);                        /* cv_arr */
     BUMP_NEED(S, double, n);                        /* sv_arr */
     BUMP_NEED(S, double, n);                        /* R */
@@ -1897,6 +1909,7 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
         else if (b2 < 1e-24) i3[n3++] = j;
         else                  i1[n1++] = j;
     }
+    int direct_write = (n1 == n);
 
     /* ---- Zero matrices when edge cases present ---- */
     if (n2 > 0 || n3 > 0) {
@@ -1939,7 +1952,7 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
         }                                                                 \
     }
 
-    DO_EDGE_HC4(n2, i2, rb_f, ell+m, ell-m, ((ell+m)&1 ? 1.0 : -1.0))
+    DO_EDGE_HC4(n2, i2, rb_f, ell+m, ell-m, ((ell+m)&1 ? -1.0 : 1.0))
     DO_EDGE_HC4(n3, i3, ra_f, ell+m, ell+m, 1.0)
     #undef DO_EDGE_HC4
 
@@ -1947,12 +1960,6 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
     if (n1 > 0) {
         B.ptr = saved_ptr;
 
-        double complex *ua     = BUMP(B, double complex, n1);
-        double complex *ub     = BUMP(B, double complex, n1);
-        double complex *ua_inv = BUMP(B, double complex, n1);
-        double complex *ub_inv = BUMP(B, double complex, n1);
-        double *c2     = BUMP(B, double, n1);
-        double *s2     = BUMP(B, double, n1);
         double *cv_arr = BUMP(B, double, n1);  /* sqrt(c2) = |ra| */
         double *sv_arr = BUMP(B, double, n1);  /* sqrt(s2) = |rb| */
         double *R      = BUMP(B, double, n1);
@@ -1967,10 +1974,18 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
         double *d_prev  = BUMP(B, double, rec_sz);
         double *d_prev2 = BUMP(B, double, rec_sz);
 
-        if (!ua||!ub||!ua_inv||!ub_inv||!c2||!s2||!cv_arr||!sv_arr||
+        if (!cv_arr||!sv_arr||
             !R||!cos_b||!cv_pw||!sv_pw||!ua_pw||!ub_pw||!d_prev||!d_prev2) {
             free(mem); return -1;
         }
+
+        /* Seed ua_pw/ub_pw rows for power 0, +1, -1 directly */
+        size_t ua_z = (size_t)P * n1;  /* power-0 row offset */
+        size_t ub_z = (size_t)P * n1;
+        size_t ua_p1 = (size_t)(P + 1) * n1;  /* power +1 */
+        size_t ua_m1 = (size_t)(P - 1) * n1;  /* power -1 */
+        size_t ub_p1 = (size_t)(P + 1) * n1;
+        size_t ub_m1 = (size_t)(P - 1) * n1;
 
         for (size_t k = 0; k < n1; ++k) {
             double complex a = ra_f[i1[k]], b = rb_f[i1[k]];
@@ -1978,24 +1993,27 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
             double re_b = creal(b), im_b = cimag(b);
             double a2 = re_a*re_a + im_a*im_a;
             double b2 = re_b*re_b + im_b*im_b;
-            c2[k] = a2;
-            s2[k] = b2;
             cv_arr[k] = sqrt(a2);
             sv_arr[k] = sqrt(b2);
             R[k]  = b2 / a2;
             cos_b[k] = a2 - b2;
             double complex u_a = a / cv_arr[k];
             double complex u_b = b / sv_arr[k];
-            ua[k] = u_a;
-            ub[k] = u_b;
-            ua_inv[k] = conj(u_a);
-            ub_inv[k] = conj(u_b);
+            /* Seed power tables directly */
+            ua_pw[ua_z + k] = 1.0;         /* power 0 */
+            ua_pw[ua_p1 + k] = u_a;        /* power +1 */
+            ua_pw[ua_m1 + k] = conj(u_a);  /* power -1 */
+            ub_pw[ub_z + k] = 1.0;
+            ub_pw[ub_p1 + k] = u_b;
+            ub_pw[ub_m1 + k] = conj(u_b);
         }
 
-        build_real_pows(cv_arr, n1, QP - 1, cv_pw);
-        build_real_pows(sv_arr, n1, QP - 1, sv_pw);
-        build_unit_pows(ua, ua_inv, n1, P, ua_pw);
-        build_unit_pows(ub, ub_inv, n1, P, ub_pw);
+        if (ellMax > 4) {
+            build_real_pows(cv_arr, n1, QP - 1, cv_pw);
+            build_real_pows(sv_arr, n1, QP - 1, sv_pw);
+        }
+        build_unit_pows_from_seed(n1, P, ua_pw);
+        build_unit_pows_from_seed(n1, P, ub_pw);
 
         /* ---- Hot loop over ell ---- */
         size_t mode_offset = 0;
@@ -2003,6 +2021,16 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
             int ell = i + 2;
             size_t dim = (size_t)(2*ell+1);
             double complex * restrict mat = matrices[i];
+
+            /* Fused path: accumulate D*h directly into output, skip D matrix */
+            const double complex *h_base_f = NULL;
+            double complex *out_base_f = NULL;
+            int fused = (h_data != NULL) && (n1 > 0);
+            if (fused) {
+                h_base_f = h_data + mode_offset * n;
+                out_base_f = out_data + mode_offset * n;
+                memset(out_base_f, 0, dim * n * sizeof(double complex));
+            }
 
             /* For ell <= 4: use hardcoded formulas to fill d_prev2 buffer */
             int used_hardcoded = 0;
@@ -2018,49 +2046,71 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
             }
 
             if (used_hardcoded) {
-                /* Write from d_prev2 buffer to matrix using phases and symmetry */
-                for (int mp = 0; mp <= ell; ++mp) {
-                    int m_start = (mp > 0) ? -mp : 0;
-                    for (int m = m_start; m <= ell; ++m) {
-                        size_t rec_idx = (size_t)(m + ellMax) * (size_t)dim_rec * n1
-                                       + (size_t)(mp + ellMax) * n1;
+                if (!fused) {
+                    /* Write from d_prev2 buffer to matrix using phases and symmetry */
+                    for (int mp = 0; mp <= ell; ++mp) {
+                        int m_start = (mp > 0) ? -mp : 0;
+                        for (int m = m_start; m <= ell; ++m) {
+                            size_t rec_idx = (size_t)(m + ellMax) * (size_t)dim_rec * n1
+                                           + (size_t)(mp + ellMax) * n1;
 
-                        const double complex *ph_a = ua_pw + (size_t)(P + m + mp) * n1;
-                        const double complex *ph_b = ub_pw + (size_t)(P + m - mp) * n1;
-                        double sym_sign = ((m - mp) & 1) ? -1.0 : 1.0;
+                            const double complex *ph_a = ua_pw + (size_t)(P + m + mp) * n1;
+                            const double complex *ph_b = ub_pw + (size_t)(P + m - mp) * n1;
+                            double sym_sign = ((m - mp) & 1) ? -1.0 : 1.0;
 
-                        /* Position 1: (m, mp) */
-                        {
-                            double complex *dst = mat + (size_t)(ell+m)*dim*n + (size_t)(ell+mp)*n;
-                            for (size_t k = 0; k < n1; ++k)
-                                dst[i1[k]] = d_prev2[rec_idx + k] * ph_a[k] * ph_b[k];
-                        }
-                        /* Position 2: (mp, m) */
-                        if (mp != m) {
-                            const double complex *ph_b2 = ub_pw + (size_t)(P + mp - m) * n1;
-                            double complex *dst = mat + (size_t)(ell+mp)*dim*n + (size_t)(ell+m)*n;
-                            for (size_t k = 0; k < n1; ++k)
-                                dst[i1[k]] = sym_sign * d_prev2[rec_idx + k] * ph_a[k] * ph_b2[k];
-                        }
-                        /* Position 3: (-m, -mp) */
-                        if (m > 0 || mp > 0) {
-                            const double complex *ph_a3 = ua_pw + (size_t)(P - m - mp) * n1;
-                            const double complex *ph_b3 = ub_pw + (size_t)(P - m + mp) * n1;
-                            double complex *dst = mat + (size_t)(ell-m)*dim*n + (size_t)(ell-mp)*n;
-                            for (size_t k = 0; k < n1; ++k)
-                                dst[i1[k]] = sym_sign * d_prev2[rec_idx + k] * ph_a3[k] * ph_b3[k];
-                        }
-                        /* Position 4: (-mp, -m) */
-                        if (mp != m && (m > 0 || mp > 0)) {
-                            const double complex *ph_a4 = ua_pw + (size_t)(P - m - mp) * n1;
-                            double complex *dst = mat + (size_t)(ell-mp)*dim*n + (size_t)(ell-m)*n;
-                            for (size_t k = 0; k < n1; ++k)
-                                dst[i1[k]] = d_prev2[rec_idx + k] * ph_a4[k] * ph_b[k];
+                            /* Position 1: (m, mp) */
+                            {
+                                double complex *dst = mat + (size_t)(ell+m)*dim*n + (size_t)(ell+mp)*n;
+                                if (direct_write) {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[k] = d_prev2[rec_idx + k] * ph_a[k] * ph_b[k];
+                                } else {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[i1[k]] = d_prev2[rec_idx + k] * ph_a[k] * ph_b[k];
+                                }
+                            }
+                            /* Position 2: (mp, m) */
+                            if (mp != m) {
+                                const double complex *ph_b2 = ub_pw + (size_t)(P + mp - m) * n1;
+                                double complex *dst = mat + (size_t)(ell+mp)*dim*n + (size_t)(ell+m)*n;
+                                if (direct_write) {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[k] = sym_sign * d_prev2[rec_idx + k] * ph_a[k] * ph_b2[k];
+                                } else {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[i1[k]] = sym_sign * d_prev2[rec_idx + k] * ph_a[k] * ph_b2[k];
+                                }
+                            }
+                            /* Position 3: (-m, -mp) */
+                            if (m > 0 || mp > 0) {
+                                const double complex *ph_a3 = ua_pw + (size_t)(P - m - mp) * n1;
+                                const double complex *ph_b3 = ub_pw + (size_t)(P - m + mp) * n1;
+                                double complex *dst = mat + (size_t)(ell-m)*dim*n + (size_t)(ell-mp)*n;
+                                if (direct_write) {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[k] = sym_sign * d_prev2[rec_idx + k] * ph_a3[k] * ph_b3[k];
+                                } else {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[i1[k]] = sym_sign * d_prev2[rec_idx + k] * ph_a3[k] * ph_b3[k];
+                                }
+                            }
+                            /* Position 4: (-mp, -m) */
+                            if (mp != m && (m > 0 || mp > 0)) {
+                                const double complex *ph_a4 = ua_pw + (size_t)(P - m - mp) * n1;
+                                double complex *dst = mat + (size_t)(ell-mp)*dim*n + (size_t)(ell-m)*n;
+                                if (direct_write) {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[k] = d_prev2[rec_idx + k] * ph_a4[k] * ph_b[k];
+                                } else {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[i1[k]] = d_prev2[rec_idx + k] * ph_a4[k] * ph_b[k];
+                                }
+                            }
                         }
                     }
                 }
             } else {
-                /* ell > 4: general Horner + recurrence (same as wignerD_matrices_opt) */
+                /* ell > 4: general Horner + recurrence */
                 for (int mp = 0; mp <= ell; ++mp) {
                     int m_start = (mp > 0) ? -mp : 0;
                     for (int m = m_start; m <= ell; ++m) {
@@ -2101,51 +2151,141 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
                             }
                         }
 
-                        /* Write to matrix with phases and symmetry */
-                        const double complex *ph_a = ua_pw + (size_t)(P + m + mp) * n1;
-                        const double complex *ph_b = ub_pw + (size_t)(P + m - mp) * n1;
-                        double sym_sign = ((m - mp) & 1) ? -1.0 : 1.0;
+                        if (!fused) {
+                            /* Write to matrix with phases and symmetry */
+                            const double complex *ph_a = ua_pw + (size_t)(P + m + mp) * n1;
+                            const double complex *ph_b = ub_pw + (size_t)(P + m - mp) * n1;
+                            double sym_sign = ((m - mp) & 1) ? -1.0 : 1.0;
 
-                        {
-                            double complex *dst = mat + (size_t)(ell+m)*dim*n + (size_t)(ell+mp)*n;
-                            for (size_t k = 0; k < n1; ++k)
-                                dst[i1[k]] = d_prev2[rec_idx + k] * ph_a[k] * ph_b[k];
-                        }
-                        if (mp != m) {
-                            const double complex *ph_b2 = ub_pw + (size_t)(P + mp - m) * n1;
-                            double complex *dst = mat + (size_t)(ell+mp)*dim*n + (size_t)(ell+m)*n;
-                            for (size_t k = 0; k < n1; ++k)
-                                dst[i1[k]] = sym_sign * d_prev2[rec_idx + k] * ph_a[k] * ph_b2[k];
-                        }
-                        if (m > 0 || mp > 0) {
-                            const double complex *ph_a3 = ua_pw + (size_t)(P - m - mp) * n1;
-                            const double complex *ph_b3 = ub_pw + (size_t)(P - m + mp) * n1;
-                            double complex *dst = mat + (size_t)(ell-m)*dim*n + (size_t)(ell-mp)*n;
-                            for (size_t k = 0; k < n1; ++k)
-                                dst[i1[k]] = sym_sign * d_prev2[rec_idx + k] * ph_a3[k] * ph_b3[k];
-                        }
-                        if (mp != m && (m > 0 || mp > 0)) {
-                            const double complex *ph_a4 = ua_pw + (size_t)(P - m - mp) * n1;
-                            double complex *dst = mat + (size_t)(ell-mp)*dim*n + (size_t)(ell-m)*n;
-                            for (size_t k = 0; k < n1; ++k)
-                                dst[i1[k]] = d_prev2[rec_idx + k] * ph_a4[k] * ph_b[k];
+                            {
+                                double complex *dst = mat + (size_t)(ell+m)*dim*n + (size_t)(ell+mp)*n;
+                                if (direct_write) {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[k] = d_prev2[rec_idx + k] * ph_a[k] * ph_b[k];
+                                } else {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[i1[k]] = d_prev2[rec_idx + k] * ph_a[k] * ph_b[k];
+                                }
+                            }
+                            if (mp != m) {
+                                const double complex *ph_b2 = ub_pw + (size_t)(P + mp - m) * n1;
+                                double complex *dst = mat + (size_t)(ell+mp)*dim*n + (size_t)(ell+m)*n;
+                                if (direct_write) {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[k] = sym_sign * d_prev2[rec_idx + k] * ph_a[k] * ph_b2[k];
+                                } else {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[i1[k]] = sym_sign * d_prev2[rec_idx + k] * ph_a[k] * ph_b2[k];
+                                }
+                            }
+                            if (m > 0 || mp > 0) {
+                                const double complex *ph_a3 = ua_pw + (size_t)(P - m - mp) * n1;
+                                const double complex *ph_b3 = ub_pw + (size_t)(P - m + mp) * n1;
+                                double complex *dst = mat + (size_t)(ell-m)*dim*n + (size_t)(ell-mp)*n;
+                                if (direct_write) {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[k] = sym_sign * d_prev2[rec_idx + k] * ph_a3[k] * ph_b3[k];
+                                } else {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[i1[k]] = sym_sign * d_prev2[rec_idx + k] * ph_a3[k] * ph_b3[k];
+                                }
+                            }
+                            if (mp != m && (m > 0 || mp > 0)) {
+                                const double complex *ph_a4 = ua_pw + (size_t)(P - m - mp) * n1;
+                                double complex *dst = mat + (size_t)(ell-mp)*dim*n + (size_t)(ell-m)*n;
+                                if (direct_write) {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[k] = d_prev2[rec_idx + k] * ph_a4[k] * ph_b[k];
+                                } else {
+                                    for (size_t k = 0; k < n1; ++k)
+                                        dst[i1[k]] = d_prev2[rec_idx + k] * ph_a4[k] * ph_b[k];
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            /* Fused matmul: reordered loop for SIMD auto-vectorization.
-             * Inner loop over t (stride-1) enables SSE/AVX on D and h.
-             */
-            if (h_data) {
+            /* Fused D@h: iterate over all (m, mp) to avoid symmetry overlaps.
+             * Maps each (m, mp) to its fundamental domain d-value, then
+             * accumulates D[m,mp] * h[mp] into out[m]. */
+            if (fused) {
+                for (int m = -ell; m <= ell; ++m) {
+                    double complex *orow = out_base_f + (size_t)(ell + m) * n;
+                    for (int mp = -ell; mp <= ell; ++mp) {
+                        const double complex *hcol = h_base_f + (size_t)(ell + mp) * n;
+
+                        /* Map (m, mp) to fundamental domain entry in d_prev2.
+                         * Fundamental domain: mp_f >= 0 AND
+                         *   (mp_f > 0 ? m_f >= -mp_f : m_f >= 0).
+                         * Symmetries: d(m,mp) = (-1)^(m-mp) * d(mp,m)  [swap]
+                         *             d(m,mp) = (-1)^(m-mp) * d(-m,-mp) [negate]
+                         *             d(m,mp) = d(-mp,-m)              [swap+negate] */
+                        #define IS_FUND(a, b) ((b) >= 0 && ((b) > 0 ? (a) >= -(b) : (a) >= 0))
+                        int m_f, mp_f;
+                        double dsign;
+                        if (IS_FUND(m, mp)) {
+                            m_f = m; mp_f = mp; dsign = 1.0;
+                        } else if (IS_FUND(-m, -mp)) {
+                            m_f = -m; mp_f = -mp; dsign = ((m - mp) & 1) ? -1.0 : 1.0;
+                        } else if (IS_FUND(mp, m)) {
+                            m_f = mp; mp_f = m; dsign = ((m - mp) & 1) ? -1.0 : 1.0;
+                        } else {
+                            m_f = -mp; mp_f = -m; dsign = 1.0;
+                        }
+                        #undef IS_FUND
+
+                        size_t rec_idx = (size_t)(m_f + ellMax) * (size_t)dim_rec * n1
+                                       + (size_t)(mp_f + ellMax) * n1;
+                        const double complex *ph_a = ua_pw + (size_t)(P + m + mp) * n1;
+                        const double complex *ph_b = ub_pw + (size_t)(P + m - mp) * n1;
+
+                        if (direct_write) {
+                            for (size_t k = 0; k < n1; ++k) {
+                                double d_val = dsign * d_prev2[rec_idx + k];
+                                /* phase = ph_a * ph_b (complex multiply) */
+                                double ar = creal(ph_a[k]), ai = cimag(ph_a[k]);
+                                double br = creal(ph_b[k]), bi = cimag(ph_b[k]);
+                                double t1 = ar * br, t2 = ai * br;
+                                double pr = fma(-ai, bi, t1);   /* ar*br - ai*bi */
+                                double pi_v = fma(ar, bi, t2);  /* ar*bi + ai*br */
+                                /* D_val = d_val * phase */
+                                double Dr = d_val * pr;
+                                double Di = d_val * pi_v;
+                                /* accumulate D_val * h into orow */
+                                double hr = creal(hcol[k]), hi = cimag(hcol[k]);
+                                double or_v = creal(orow[k]), oi_v = cimag(orow[k]);
+                                orow[k] = fma(Dr, hr, fma(-Di, hi, or_v))
+                                        + fma(Dr, hi, fma( Di, hr, oi_v)) * I;
+                            }
+                        } else {
+                            for (size_t k = 0; k < n1; ++k) {
+                                size_t j = i1[k];
+                                double d_val = dsign * d_prev2[rec_idx + k];
+                                double ar = creal(ph_a[k]), ai = cimag(ph_a[k]);
+                                double br = creal(ph_b[k]), bi = cimag(ph_b[k]);
+                                double t1 = ar * br, t2 = ai * br;
+                                double pr = fma(-ai, bi, t1);
+                                double pi_v = fma(ar, bi, t2);
+                                double Dr = d_val * pr;
+                                double Di = d_val * pi_v;
+                                double hr = creal(hcol[j]), hi = cimag(hcol[j]);
+                                double or_v = creal(orow[j]), oi_v = cimag(orow[j]);
+                                orow[j] = fma(Dr, hr, fma(-Di, hi, or_v))
+                                        + fma(Dr, hi, fma( Di, hr, oi_v)) * I;
+                            }
+                        }
+                    }
+                }
+                mode_offset += (size_t)dim;
+            } else if (h_data) {
+                /* Matmul fallback: h_data present but n1==0 (all edge cases) */
                 const double complex *h_base = h_data + mode_offset * n;
                 double complex *out_base = out_data + mode_offset * n;
                 for (int row = 0; row < (int)dim; row++) {
                     double complex *out_row = out_base + (size_t)row * n;
-                    /* Zero the output row */
                     for (size_t t = 0; t < n; t++)
                         out_row[t] = 0;
-                    /* Accumulate D[row,col,t] * h[col,t] */
                     for (int col = 0; col < (int)dim; col++) {
                         const double complex *D_rc = mat
                             + (size_t)row * dim * n + (size_t)col * n;
@@ -2164,28 +2304,42 @@ int wignerD_matrices(const double * restrict q, size_t n, int ellMax,
         }
     }
 
-    /* Fallback matmul when n1==0 (all edge cases, no general path ran) */
+    /* Zero output for edge-case-only path (n1==0, fused didn't run) */
     if (h_data && n1 == 0) {
-        size_t mode_offset = 0;
+        size_t total_modes = 0;
+        for (int i = 0; i < NL; ++i) total_modes += (size_t)(2*(i+2)+1);
+        memset(out_data, 0, total_modes * n * sizeof(double complex));
+    }
+
+    /* Edge-case mini-matmul: accumulate D[row,col]*h[col] at edge indices.
+     * When fused path handled general-case points, this adds the edge-case
+     * contributions. When n1==0 (all edge cases), the fused path didn't run
+     * and output was zeroed, so this produces the full result. */
+    if (h_data && (n2 > 0 || n3 > 0)) {
+        size_t mode_offset_ec = 0;
         for (int i = 0; i < NL; ++i) {
             int ell = i + 2;
             size_t dim = (size_t)(2*ell+1);
             const double complex *D = matrices[i];
-            const double complex *h_base = h_data + mode_offset * n;
-            double complex *out_base = out_data + mode_offset * n;
+            const double complex *h_base = h_data + mode_offset_ec * n;
+            double complex *out_base = out_data + mode_offset_ec * n;
             for (int row = 0; row < (int)dim; row++) {
                 double complex *out_row = out_base + (size_t)row * n;
-                for (size_t t = 0; t < n; t++)
-                    out_row[t] = 0;
                 for (int col = 0; col < (int)dim; col++) {
                     const double complex *D_rc = D
                         + (size_t)row * dim * n + (size_t)col * n;
                     const double complex *h_col = h_base + (size_t)col * n;
-                    for (size_t t = 0; t < n; t++)
-                        out_row[t] += D_rc[t] * h_col[t];
+                    for (size_t ki = 0; ki < n2; ki++) {
+                        size_t j = i2[ki];
+                        out_row[j] += D_rc[j] * h_col[j];
+                    }
+                    for (size_t ki = 0; ki < n3; ki++) {
+                        size_t j = i3[ki];
+                        out_row[j] += D_rc[j] * h_col[j];
+                    }
                 }
             }
-            mode_offset += dim;
+            mode_offset_ec += dim;
         }
     }
 
