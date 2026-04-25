@@ -304,9 +304,13 @@ static void spline_plan_free(spline_plan *plan) {
  * For T = std::complex<double> the template overloads compute a*b+c.
  *
  * Scratch layout  (one std::vector<unsigned char> allocation):
- *   [  c_all : n * num_datasets * sizeof(T)  ]
- *   [  rhs   : ni * sizeof(T)                ]   (reused per dataset)
+ *   [  c_all : n * num_datasets * sizeof(T)  ]   SoA: c_all[i * nd + d]
  *   [  idx_buf: out_size * sizeof(int)        ]
+ *
+ * c_all uses position-major (SoA) layout so the d-inner loops in Phases 1
+ * and 2b have stride-1 access and can be auto-vectorized.  The forward
+ * sweep stores intermediate RHS values in c_all[1..n-2]; back-substitution
+ * overwrites them in-place, eliminating a separate rhs buffer.
  *
  * std::bad_alloc on OOM is caught in the extern "C" wrappers.
  * ====================================================================== */
@@ -323,66 +327,95 @@ static int spline_interp_multi_tmpl(
 
     const long   n        = plan->n;
     const long   ni       = n - 2;
+    const long   nd       = num_datasets;
     const double *restrict data_x   = plan->data_x;
     const double *restrict h        = plan->h;
     const double *restrict inv_h    = plan->inv_h;
     const double *restrict diag_fac = plan->diag;
 
     /* Single scratch allocation — std::bad_alloc propagates to extern "C" */
-    const size_t c_sz   = (size_t)n  * (size_t)num_datasets * sizeof(T);
-    const size_t rhs_sz = (size_t)ni * sizeof(T);
+    const size_t c_sz   = (size_t)n  * (size_t)nd * sizeof(T);
     const size_t idx_sz = (size_t)out_size * sizeof(int);
 
-    std::vector<unsigned char> scratch(c_sz + rhs_sz + idx_sz);
+    std::vector<unsigned char> scratch(c_sz + idx_sz);
 
+    /* c_all layout: c_all[i * nd + d] — position-major (SoA) */
     T   *restrict c_all   = reinterpret_cast<T *>(scratch.data());
-    T   *restrict rhs     = reinterpret_cast<T *>(scratch.data() + c_sz);
-    int *restrict idx_buf = reinterpret_cast<int *>(scratch.data() + c_sz + rhs_sz);
+    int *restrict idx_buf = reinterpret_cast<int *>(scratch.data() + c_sz);
 
     /* -------------------------------------------------------------------
-     * Phase 1: Tridiagonal solve for c[1..n-2] (one per dataset).
+     * Phase 1: Tridiagonal solve — k-outer, d-inner (SoA).
      *
-     * rhs[k] corresponds to interior point i = k+1.
-     * raw_rhs[k] = 6*((y[i+1]-y[i])/h[i] - (y[i]-y[i-1])/h[i-1])
-     *            = 6*(y[i+1]*inv_h[i] - y[i]*(inv_h[i]+inv_h[i-1])
-     *                 + y[i-1]*inv_h[i-1])
-     *
-     * Forward sweep:
-     *   rhs[0] = raw_rhs[0]
-     *   rhs[k] = raw_rhs[k] - (h[k]/diag[k-1])*rhs[k-1]  (k >= 1)
-     *
-     * Back-substitution:
-     *   c[n-2] = rhs[ni-1] / diag[ni-1]
-     *   c[k+1] = (rhs[k] - h[k+1]*c[k+2]) / diag[k]      (k = ni-2..0)
+     * Scalar work (factor, inv_h sums) is hoisted outside the d loop.
+     * The d-inner loop has stride-1 access to c_all rows for SIMD.
+     * RHS values are stored in c_all[(k+1)*nd .. ] during forward sweep;
+     * back-substitution overwrites them in-place with the solution.
      * ------------------------------------------------------------------- */
-    for (long d = 0; d < num_datasets; ++d) {
-        const T *restrict y = data_y[d];
-        T *restrict       c = c_all + d * n;
 
-        c[0]     = T(0.0);
-        c[n - 1] = T(0.0);
-
-        /* k=0, i=1: no elimination needed */
-        rhs[0] = T(6.0) * spline_fma(y[2], inv_h[1],
-                              spline_fma(-y[1], inv_h[1] + inv_h[0],
-                                          y[0] * inv_h[0]));
-
-        /* k=1..ni-1, i=2..n-2 */
-        for (long k = 1; k < ni; ++k) {
-            const long i   = k + 1;
-            const T    raw = T(6.0) * spline_fma(y[i+1], inv_h[i],
-                                         spline_fma(-y[i], inv_h[i] + inv_h[i-1],
-                                                     y[i-1] * inv_h[i-1]));
-            const double factor = h[k] / diag_fac[k-1];
-            rhs[k] = raw - factor * rhs[k-1];
+    /* Boundary conditions: c[0,d] = c[n-1,d] = 0 */
+    {
+        T *restrict c0 = c_all;
+        T *restrict cn = c_all + (n - 1) * nd;
+        for (long d = 0; d < nd; ++d) {
+            c0[d] = T(0.0);
+            cn[d] = T(0.0);
         }
+    }
 
-        /* Back-substitution */
-        c[n-2] = rhs[ni-1] / diag_fac[ni-1];
+    /* k=0 (i=1): no elimination needed */
+    {
+        const double ih1    = inv_h[1];
+        const double ih0    = inv_h[0];
+        const double ih_sum = ih1 + ih0;
+        T *restrict row = c_all + nd;  /* c_all[1 * nd] */
+        for (long d = 0; d < nd; ++d) {
+            const T *restrict y = data_y[d];
+            row[d] = T(6.0) * spline_fma(y[2], ih1,
+                                  spline_fma(-y[1], ih_sum,
+                                              y[0] * ih0));
+        }
+    }
 
-        for (long k = ni-2; k >= 0; --k) {
-            const long i = k + 1;
-            c[i] = (rhs[k] - h[k+1] * c[i+1]) / diag_fac[k];
+    /* k=1..ni-1 (i=2..n-2): forward elimination */
+    for (long k = 1; k < ni; ++k) {
+        const long   i      = k + 1;
+        const double factor = h[k] / diag_fac[k - 1];
+        const double ihi    = inv_h[i];
+        const double ihim1  = inv_h[i - 1];
+        const double ih_sum = ihi + ihim1;
+
+        const T *restrict prev = c_all + k * nd;       /* rhs[k-1] */
+        T *restrict       curr = c_all + (k + 1) * nd; /* rhs[k]   */
+
+        for (long d = 0; d < nd; ++d) {
+            const T *restrict y = data_y[d];
+            const T raw = T(6.0) * spline_fma(y[i+1], ihi,
+                                       spline_fma(-y[i], ih_sum,
+                                                   y[i-1] * ihim1));
+            curr[d] = raw - factor * prev[d];
+        }
+    }
+
+    /* Back-substitution: last interior point */
+    {
+        const double inv_diag_last = 1.0 / diag_fac[ni - 1];
+        T *restrict row = c_all + (n - 2) * nd;
+        for (long d = 0; d < nd; ++d) {
+            row[d] = row[d] * inv_diag_last;
+        }
+    }
+
+    /* Back-substitution: remaining interior points */
+    for (long k = ni - 2; k >= 0; --k) {
+        const long   i        = k + 1;
+        const double hk1      = h[k + 1];
+        const double inv_diag = 1.0 / diag_fac[k];
+
+        T *restrict       ci_row  = c_all + i * nd;
+        const T *restrict ci1_row = c_all + (i + 1) * nd;
+
+        for (long d = 0; d < nd; ++d) {
+            ci_row[d] = (ci_row[d] - hk1 * ci1_row[d]) * inv_diag;
         }
     }
 
@@ -402,42 +435,36 @@ static int spline_interp_multi_tmpl(
     }
 
     /* -------------------------------------------------------------------
-     * Phase 2b: Evaluate spline — d-outer for cache locality on c/y rows,
-     *           j-inner for stride-1 writes to out_row.
+     * Phase 2b: Evaluate spline — j-outer, d-inner for stride-1 c reads
+     *           from SoA layout.  Scalar geometry (t, inv_hi, hi_inv6) is
+     *           computed once per output point outside the d loop.
      *
      * Horner form: S = y[i] + t*(b + t*(c[i]/2 + t*d))
-     *
-     * spline_fma dispatches to std::fma (HW FMA) when T=double, and to
-     * a*b+c when T=std::complex<double>.
      * ------------------------------------------------------------------- */
-    for (long d = 0; d < num_datasets; ++d) {
-        const T *restrict y       = data_y[d];
-        const T *restrict c       = c_all + d * n;
-        T *restrict       out_row = out_y[d];
+    for (long j = 0; j < out_size; ++j) {
+        const int    idx     = idx_buf[j];
+        const double t       = out_x[j] - data_x[idx];
+        const double inv_hi  = inv_h[idx];
+        const double hi_inv6 = h[idx] * (1.0 / 6.0);
 
-#if defined(__clang__)
-#  pragma clang loop vectorize(enable) interleave(enable)
-#elif defined(__GNUC__)
-#  pragma GCC ivdep
-#endif
-        for (long j = 0; j < out_size; ++j) {
-            const int    idx     = idx_buf[j];
-            const double t       = out_x[j] - data_x[idx];
-            const double inv_hi  = inv_h[idx];
-            const double hi_inv6 = h[idx] * (1.0 / 6.0);
+        const T *restrict c_row0 = c_all + idx * nd;
+        const T *restrict c_row1 = c_all + (idx + 1) * nd;
 
-            const T ci      = c[idx];
-            const T ci1     = c[idx + 1];
+        for (long d = 0; d < nd; ++d) {
+            const T ci      = c_row0[d];
+            const T ci1     = c_row1[d];
+            const T yi      = data_y[d][idx];
+            const T yi1     = data_y[d][idx + 1];
             const T d_coeff = (ci1 - ci) * inv_hi * (1.0/6.0);
             const T b       = spline_fma(-hi_inv6,
                                          spline_fma(2.0, ci, ci1),
-                                         (y[idx+1] - y[idx]) * inv_hi);
+                                         (yi1 - yi) * inv_hi);
 
-            out_row[j] = spline_fma(t,
-                         spline_fma(t,
-                         spline_fma(t, d_coeff, ci * 0.5),
-                         b),
-                         y[idx]);
+            out_y[d][j] = spline_fma(t,
+                          spline_fma(t,
+                          spline_fma(t, d_coeff, ci * 0.5),
+                          b),
+                          yi);
         }
     }
 
