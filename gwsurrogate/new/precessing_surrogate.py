@@ -381,8 +381,18 @@ cubic interpolation. Use get_time_deriv_from_index when possible.
 
     def get_omega(self, i0, q, y):
         x = _utils.get_ds_fit_x(y, q)
-        fit_params = self._get_fit_params(x)
-        omega = _eval_scalar_fit(self.fit_data[i0]['omega'], fit_params, self._fit_settings)
+        if self._fit_params_mode == 0:
+            # Inline NRSur7dq4 transform: avoid _get_fit_params overhead
+            chi1z, chi2z = x[3], x[6]
+            x[0] = self._q_consts[0]   # log(q)
+            chi_wtAvg = self._q_consts[1]*chi1z + self._q_consts[2]*chi2z
+            x[3] = (chi_wtAvg - self._q_consts[3]*(chi1z + chi2z)) / self._q_consts[4]
+            x[6] = (chi1z - chi2z) * 0.5
+        elif self._fit_params_mode < 0:
+            # Legacy path: Python transform
+            x = self._get_fit_params(x)
+        # mode 1 = identity, x unchanged
+        omega = _eval_scalar_fit(self.fit_data[i0]['omega'], x, self._fit_settings)
         return omega
 
     def _get_t_from_omega(self, omega_ref, q, chiA0, chiB0, init_orbphase,
