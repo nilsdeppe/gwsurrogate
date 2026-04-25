@@ -408,10 +408,16 @@ cubic interpolation. Use get_time_deriv_from_index when possible.
         if init_quat is not None:
             y0[:4] = init_quat
 
-        omega0 = self.get_omega(0, q, y0)
-        if omega_ref < omega0:
-            raise Exception("Got omega_ref = %0.4f < %0.4f = omega_0, "
-                    "too small!"%(omega_ref, omega0))
+        # Compute fit_params once (y0 and q are constant across all nodes)
+        x = _utils.get_ds_fit_x(y0, q)
+        if self._fit_params_mode == 0:
+            chi1z, chi2z = x[3], x[6]
+            x[0] = self._q_consts[0]
+            chi_wtAvg = self._q_consts[1]*chi1z + self._q_consts[2]*chi2z
+            x[3] = (chi_wtAvg - self._q_consts[3]*(chi1z + chi2z)) / self._q_consts[4]
+            x[6] = (chi1z - chi2z) * 0.5
+        elif self._fit_params_mode < 0:
+            x = self._get_fit_params(x)
 
         # In this function we don't use the 3 half-node indices at the
         # start. This is mainly to agree with the LAL implementation, where
@@ -421,14 +427,27 @@ cubic interpolation. Use get_time_deriv_from_index when possible.
         full_node_indices.remove(3)
         full_node_indices.remove(5)
 
-        # i0=0 is a lower bound, find the first index where omega > omega_ref
-        imax = 1
-        omega_min = omega0
-        omega_max = self.get_omega(full_node_indices[imax], q, y0)
-        while omega_max <= omega_ref:
-            imax += 1
-            omega_min = omega_max
-            omega_max = self.get_omega(full_node_indices[imax], q, y0)
+        # Batch-evaluate omega at all nodes in one C call
+        q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder = \
+            self._fit_settings
+        omega_fits = [(self.fit_data[ni]['omega']['bfOrders'],
+                       self.fit_data[ni]['omega']['coefs'])
+                      for ni in full_node_indices]
+        all_omegas = _utils.eval_fit_batch(omega_fits, x,
+            q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder)
+
+        omega0 = all_omegas[0]
+        if omega_ref < omega0:
+            raise Exception("Got omega_ref = %0.4f < %0.4f = omega_0, "
+                    "too small!"%(omega_ref, omega0))
+
+        # Find bracket: first index where omega > omega_ref
+        imax = np.searchsorted(all_omegas, omega_ref, side='right')
+        if imax < 1:
+            imax = 1
+
+        omega_min = all_omegas[imax - 1]
+        omega_max = all_omegas[imax]
 
         # Do a linear interpolation between omega_min and omega_max
         t_min = self.t[full_node_indices[imax-1]]
