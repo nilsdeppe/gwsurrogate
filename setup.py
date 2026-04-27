@@ -39,6 +39,21 @@ extmod = Extension(
 )
 extmods.append(extmod)
 
+# build extension 1b: quintic Hermite interpolation (no external deps)
+extmod = Extension(
+    "gwsurrogate.spline_interp_Cwrapper._quintic_interp",
+    extra_compile_args=["-std=c99", "-O3", "-fPIC"] + _arch_flags,
+    extra_link_args=_arch_flags,
+    language="c",
+    sources=[
+        "gwsurrogate/spline_interp_Cwrapper/_quintic_interp.c",
+        "gwsurrogate/spline_interp_Cwrapper/QuinticHermite.c",
+        "gwsurrogate/spline_interp_Cwrapper/Fornberg.c",
+    ],
+    include_dirs=["gwsurrogate/spline_interp_Cwrapper"],
+)
+extmods.append(extmod)
+
 # build extension 2: precessing utils
 extmod = Extension(
     "gwsurrogate.precessing_utils._utils",

@@ -13,7 +13,8 @@ import numpy as np
 import h5py
 from gwsurrogate.precessing_utils import _utils
 from gwtools.harmonics import sYlm
-from gwsurrogate.new.surrogate import _splinterp_Cwrapper, _splinterp_Cwrapper_many, _splinterp_Cwrapper_many_complex
+from gwsurrogate.new.surrogate import _splinterp_Cwrapper, _splinterp_Cwrapper_many
+from gwsurrogate.spline_interp_Cwrapper import get_interp_func
 
 
 ###############################################################################
@@ -1091,6 +1092,7 @@ def inertial_waveform_modes(t, orbphase, quat, h_coorb):
     h_inertial = rotateWaveform(qfull, h_coorb)
     return h_inertial
 
+
 def splinterp_many(t_out, t_in, many_things):
     return _splinterp_Cwrapper_many(t_out, t_in, many_things)
 
@@ -1146,6 +1148,62 @@ omega_ref_max_model: The maximium allowable reference dimensionless
 
         self.mode_list = self.coorb_sur.mode_list
 
+        # Default coarse-grid rotation settings.
+        # Can be reconfigured via set_interp_method().
+        self._rotation_stride = 4
+        self._interp_func = get_interp_func('lagrange8')
+        self._coarse_rotation_idx = self._build_coarse_idx(
+            self.t_coorb, self._rotation_stride)
+        self._interp_method_name = 'lagrange8'
+
+    def set_interp_method(self, method='lagrange6', stride=None):
+        """Configure the interpolation method for coarse-grid rotation.
+
+        Parameters
+        ----------
+        method : str
+            Interpolation method. Options: 'cubic', 'lagrange4',
+            'lagrange6', 'lagrange8', 'lagrange10', 'lagrange12',
+            'quintic_hermite'.
+        stride : int, optional
+            Coarse-grid stride (every stride-th point is kept for rotation).
+            If None, uses a reasonable default for the method:
+            cubic→2, lagrange4→2, lagrange6→3, lagrange8→4,
+            lagrange10→5, lagrange12→5, quintic_hermite→3,
+            floater_hormann3→3, floater_hormann5→4, floater_hormann7→5,
+            bspline5→3.
+        """
+        default_strides = {
+            'cubic': 2, 'lagrange4': 2, 'lagrange6': 3,
+            'lagrange8': 4, 'lagrange10': 5, 'lagrange12': 5,
+            'quintic_hermite': 3,
+            'floater_hormann3': 3, 'floater_hormann5': 4,
+            'floater_hormann7': 5, 'bspline5': 3,
+        }
+        self._interp_func = get_interp_func(method)
+        self._interp_method_name = method
+        if stride is None:
+            stride = default_strides.get(method, 3)
+        self._rotation_stride = stride
+        self._coarse_rotation_idx = self._build_coarse_idx(
+            self.t_coorb, stride)
+
+    @staticmethod
+    def _build_coarse_idx(t_coorb, stride):
+        """Build index array for coarse-grid rotation."""
+        idx = np.arange(0, len(t_coorb), stride)
+        if idx[-1] != len(t_coorb) - 1:
+            idx = np.append(idx, len(t_coorb) - 1)
+        return idx
+
+    def _rotate_coarse(self, h_coorb, orbphase, quat, timesM, ellMax):
+        """Rotate waveform on coarse grid and interpolate to user times."""
+        idx = self._coarse_rotation_idx
+        t_coarse = self.t_coorb[idx]
+
+        h_inertial = inertial_waveform_modes(
+            t_coarse, orbphase[idx], quat[:, idx], h_coorb[:, idx])
+        return self._interp_func(timesM, t_coarse, h_inertial)
 
     def _check_unused_opts(self, precessing_opts):
         """ Call this at the end of call module to check if all the
@@ -1315,10 +1373,6 @@ Returns:
         h_coorb = self.coorb_sur(q, chiA_coorb, chiB_coorb, \
                 ellMax=ellMax)
 
-        # Transform the sparsely sampled waveform
-        h_inertial = inertial_waveform_modes(self.t_coorb, orbphase, quat,
-                h_coorb)
-
         if timesM is not None:
             if timesM[-1] > self.t_coorb[-1] + 0.01:
                 raise Exception("'times' includes times larger than the"
@@ -1329,28 +1383,24 @@ Returns:
 
         if dtM is None and timesM is None:
             do_interp = False
-            # Use the sparse domain. Python normally copies numpy arrays by
-            # reference, so we do a deep copy so as to not overwrite
-            # self.t_coorb.
             timesM = np.copy(self.t_coorb)
             if t0 is not None:
-                # Truncate timesM if necessary
                 timesM = timesM[timesM >= t0]
         else:
-            ## Interpolate onto uniform domain if needed
             do_interp = True
             if dtM is not None:
-                # If omega_low=0 or None, t0 would have been set to None,
-                # in which case we use the full surrogate length
                 if t0 is None:
                     t0 = self.t_coorb[0]
                 tf = self.t_coorb[-1]
                 num_times = int(np.ceil((tf - t0)/dtM))
                 timesM = t0 + dtM*np.arange(num_times)
 
-
         if do_interp:
-            h_inertial = _splinterp_Cwrapper_many_complex(timesM, self.t_coorb, h_inertial)
+            h_inertial = self._rotate_coarse(
+                h_coorb, orbphase, quat, timesM, ellMax)
+        else:
+            h_inertial = inertial_waveform_modes(self.t_coorb, orbphase,
+                    quat, h_coorb)
 
         # Make mode dict
         h = {}

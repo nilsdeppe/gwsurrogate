@@ -87,6 +87,7 @@ def _splinterp_Cwrapper_many_complex(xout, xin, yin):
     Uses natural cubic spline boundary conditions."""
     return spline_interp_Cwrapper.interpolate_many_complex(xout, xin, yin)
 
+
 def _splinterp_Cwrapper(xout, xin, yin):
     """Uses gsl splines with a wrapper to interpolate real or complex data.
     Uses natural boundary conditions instead of not-a-knot boundary conditions

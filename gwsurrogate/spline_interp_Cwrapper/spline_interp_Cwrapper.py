@@ -13,6 +13,8 @@ def _load_c_func(dll_path, function_name, argtypes, restype=None):
     return func
 
 dll_dir = os.path.dirname(os.path.realpath(__file__))
+
+# --- Load cubic spline library ---
 dll_path_glob = '%s/_spline_interp*so'%dll_dir
 spline_libs = glob(dll_path_glob)
 if len(spline_libs) == 0:
@@ -24,25 +26,37 @@ if len(spline_libs) == 0:
 elif len(spline_libs) > 1:
   raise Exception('there should be only one _spline_interp library!')
 else:
+  _MULTI_COMPLEX_ARGS = [c_long, c_long, c_long,
+                         c_void_p, c_void_p, c_void_p, c_void_p]
   c_interp = _load_c_func(spline_libs[0], 'spline_interp', [
       c_long, c_long,
       c_void_p, c_void_p,
       c_void_p, c_void_p,
   ], restype=c_int)
-  c_interp_multi = _load_c_func(spline_libs[0], 'spline_interp_multi', [
-      c_long, c_long, c_long,
-      c_void_p,
-      c_void_p,
-      c_void_p,
-      c_void_p,
-  ], restype=c_int)
-  c_interp_multi_complex = _load_c_func(spline_libs[0], 'spline_interp_multi_complex', [
-      c_long, c_long, c_long,
-      c_void_p,
-      c_void_p,
-      c_void_p,
-      c_void_p,
-  ], restype=c_int)
+  c_interp_multi = _load_c_func(spline_libs[0], 'spline_interp_multi',
+      _MULTI_COMPLEX_ARGS, restype=c_int)
+  c_interp_multi_complex = _load_c_func(spline_libs[0],
+      'spline_interp_multi_complex', _MULTI_COMPLEX_ARGS, restype=c_int)
+
+# --- Load higher-order interpolation library ---
+_ho_funcs = {}
+quintic_libs = glob('%s/_quintic_interp*so' % dll_dir)
+if len(quintic_libs) == 1:
+    _ho_lib = quintic_libs[0]
+    _ho_funcs['quintic_hermite'] = _load_c_func(_ho_lib,
+        'quintic_interp_many_complex', _MULTI_COMPLEX_ARGS, restype=c_int)
+    for n in (4, 6, 8, 10, 12):
+        _ho_funcs['lagrange%d' % n] = _load_c_func(_ho_lib,
+            'lagrange%d_interp_many_complex' % n,
+            _MULTI_COMPLEX_ARGS, restype=c_int)
+    # Floater-Hormann barycentric rational (blend orders 3, 5, 7)
+    for d in (3, 5, 7):
+        _ho_funcs['floater_hormann%d' % d] = _load_c_func(_ho_lib,
+            'floater_hormann%d_interp_many_complex' % d,
+            _MULTI_COMPLEX_ARGS, restype=c_int)
+    # Quintic B-spline
+    _ho_funcs['bspline5'] = _load_c_func(_ho_lib,
+        'bspline5_interp_many_complex', _MULTI_COMPLEX_ARGS, restype=c_int)
 
 _SPLINE_ERRORS = {
     1: 'Memory allocation failed in spline interpolation',
@@ -57,6 +71,11 @@ def _check_spline_rc(rc):
     if rc != 0:
         msg = _SPLINE_ERRORS.get(rc, 'Unknown spline error (code %d)' % rc)
         raise RuntimeError(msg)
+
+
+# ======================================================================
+# Low-level wrappers (unchanged API for backward compatibility)
+# ======================================================================
 
 def interpolate(xnew, x, y):
     x = x.astype('float64', copy=False)
@@ -132,7 +151,7 @@ def interpolate_many(xnew, x, y):
     return ynew
 
 def interpolate_many_complex(xnew, x, y):
-    """Interpolate multiple complex128 datasets sharing the same x-grid.
+    """Interpolate multiple complex128 datasets using cubic spline.
 
     Parameters
     ----------
@@ -144,6 +163,15 @@ def interpolate_many_complex(xnew, x, y):
     -------
     ynew : (num_datasets, M) complex128 array
     """
+    return _call_many_complex(c_interp_multi_complex, xnew, x, y)
+
+
+# ======================================================================
+# Unified higher-order interpolation API
+# ======================================================================
+
+def _call_many_complex(c_func, xnew, x, y):
+    """Shared implementation for all batch complex128 interpolation calls."""
     x = np.ascontiguousarray(x, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.complex128)
     xnew = np.ascontiguousarray(xnew, dtype=np.float64)
@@ -151,13 +179,9 @@ def interpolate_many_complex(xnew, x, y):
     n_datasets, n_x = y.shape
     n_out = xnew.shape[0]
 
-    x_p    = x.ctypes.data
-    xnew_p = xnew.ctypes.data
-
     ynew = np.empty((n_datasets, n_out), dtype=np.complex128)
 
-    # Each complex128 row is 2*n doubles interleaved (re,im,re,im,...)
-    row_bytes = n_x  * 16  # sizeof(complex128) = 16
+    row_bytes = n_x  * 16
     out_bytes = n_out * 16
 
     VoidPtrArr = c_void_p * n_datasets
@@ -166,8 +190,51 @@ def interpolate_many_complex(xnew, x, y):
     y_ptrs    = VoidPtrArr(*(y_base    + d * row_bytes for d in range(n_datasets)))
     ynew_ptrs = VoidPtrArr(*(ynew_base + d * out_bytes for d in range(n_datasets)))
 
-    rc = c_interp_multi_complex(n_x, n_out, n_datasets, x_p, y_ptrs, xnew_p,
-                                ynew_ptrs)
+    rc = c_func(n_x, n_out, n_datasets,
+                x.ctypes.data, y_ptrs,
+                xnew.ctypes.data, ynew_ptrs)
     _check_spline_rc(rc)
 
     return ynew
+
+
+# Available interpolation methods for batch complex128 data.
+# Each entry maps a method name to a callable with signature
+# (xnew, x, y) -> ynew.
+INTERP_METHODS = {
+    'cubic': interpolate_many_complex,
+}
+
+# Register higher-order methods if the library was loaded
+for _name, _cfunc in _ho_funcs.items():
+    def _make_wrapper(cf):
+        return lambda xnew, x, y: _call_many_complex(cf, xnew, x, y)
+    INTERP_METHODS[_name] = _make_wrapper(_cfunc)
+
+
+def get_interp_func(method='cubic'):
+    """Return the batch complex128 interpolation function for a given method.
+
+    Parameters
+    ----------
+    method : str
+        One of: 'cubic', 'lagrange4', 'lagrange6', 'lagrange8',
+        'lagrange10', 'lagrange12', 'quintic_hermite'.
+
+    Returns
+    -------
+    callable : (xnew, x, y) -> ynew
+    """
+    if method not in INTERP_METHODS:
+        available = ', '.join(sorted(INTERP_METHODS.keys()))
+        raise ValueError(
+            "Unknown interpolation method '%s'. Available: %s" % (method, available))
+    return INTERP_METHODS[method]
+
+
+# Backward-compatible aliases
+def quintic_interpolate_many_complex(xnew, x, y):
+    return INTERP_METHODS['quintic_hermite'](xnew, x, y)
+
+def lagrange6_interpolate_many_complex(xnew, x, y):
+    return INTERP_METHODS['lagrange6'](xnew, x, y)
