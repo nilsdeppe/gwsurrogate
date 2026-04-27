@@ -958,6 +958,38 @@ class CoorbitalWaveformSurrogate:
                     np.vstack(all_EI_basis_list)),
             'mode_info': np.array(mode_groups, dtype=np.int32),
         }
+        self._unique_node_indices = np.unique(self._packed['all_node_indices'])
+
+    def _prepare_coarse(self, coarse_idx, needed_idx):
+        """Pre-compute packed data for sparse-grid evaluation.
+
+        Parameters
+        ----------
+        coarse_idx : ndarray
+            Indices into t_coorb for the coarse rotation grid.
+        needed_idx : ndarray
+            Sorted union of unique node indices and coarse_idx.
+        """
+        p = self._packed
+        # Remap node indices from absolute t_coorb indices to indices
+        # into needed_idx array
+        remapped_nodes = np.searchsorted(
+            needed_idx, p['all_node_indices']).astype(np.int32)
+        # Slice EI_basis columns to coarse_idx only (columns correspond
+        # to absolute t_coorb indices)
+        sliced_EI = np.ascontiguousarray(
+            p['all_EI_basis'][:, coarse_idx])
+        self._packed_coarse = {
+            'comp_n_nodes': p['comp_n_nodes'],
+            'comp_node_offset': p['comp_node_offset'],
+            'all_node_indices': remapped_nodes,
+            'node_n_coefs': p['node_n_coefs'],
+            'node_coef_offset': p['node_coef_offset'],
+            'all_coefs': p['all_coefs'],
+            'all_orders': p['all_orders'],
+            'all_EI_basis': sliced_EI,
+            'mode_info': p['mode_info'],
+        }
 
     def _compute_q_consts(self, q):
         """Compute q-dependent constants for C fit_params transform."""
@@ -972,24 +1004,25 @@ class CoorbitalWaveformSurrogate:
             ])
         return np.zeros(5)
 
-    def __call__(self, q, chiA, chiB, ellMax=4):
+    def __call__(self, q, chiA, chiB, ellMax=4, coarse=False):
         """
 Evaluates the coorbital waveform modes.
 q: The mass ratio
 chiA, chiB: The time-dependent spin in the coorbital frame. These should have
             shape (N, 3) where N = len(t_coorb)
 ellMax: The maximum ell mode to evaluate.
+coarse: If True, use pre-computed sparse-grid packed data.
         """
         if hasattr(self, '_packed'):
-            return self._call_c(q, chiA, chiB, ellMax)
+            return self._call_c(q, chiA, chiB, ellMax, coarse=coarse)
         return self._call_python(q, chiA, chiB, ellMax)
 
-    def _call_c(self, q, chiA, chiB, ellMax):
+    def _call_c(self, q, chiA, chiB, ellMax, coarse=False):
         nmodes = ellMax * ellMax + 2 * ellMax - 3
         q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder \
             = self._fit_settings
         q_consts = self._compute_q_consts(float(q))
-        p = self._packed
+        p = self._packed_coarse if (coarse and hasattr(self, '_packed_coarse')) else self._packed
         return _utils.eval_coorb_modes(
             float(q),
             np.ascontiguousarray(chiA, dtype=np.float64),
@@ -1155,6 +1188,7 @@ omega_ref_max_model: The maximium allowable reference dimensionless
         self._coarse_rotation_idx = self._build_coarse_idx(
             self.t_coorb, self._rotation_stride)
         self._interp_method_name = 'lagrange8'
+        self._prepare_sparse_grid()
 
     def set_interp_method(self, method='lagrange6', stride=None):
         """Configure the interpolation method for coarse-grid rotation.
@@ -1187,6 +1221,19 @@ omega_ref_max_model: The maximium allowable reference dimensionless
         self._rotation_stride = stride
         self._coarse_rotation_idx = self._build_coarse_idx(
             self.t_coorb, stride)
+        self._prepare_sparse_grid()
+
+    def _prepare_sparse_grid(self):
+        """Pre-compute sparse-grid index maps for the coarse rotation path."""
+        if not hasattr(self.coorb_sur, '_unique_node_indices'):
+            return
+        self._needed_t_idx = np.union1d(
+            self.coorb_sur._unique_node_indices,
+            self._coarse_rotation_idx)
+        self.coorb_sur._prepare_coarse(
+            self._coarse_rotation_idx, self._needed_t_idx)
+        self._coarse_in_needed = np.searchsorted(
+            self._needed_t_idx, self._coarse_rotation_idx)
 
     @staticmethod
     def _build_coarse_idx(t_coorb, stride):
@@ -1354,25 +1401,6 @@ Returns:
         chiA0 = None
         chiB0 = None
 
-        # Interpolate to the coorbital time grid, and transform to coorb frame.
-        # Interpolate first since coorbital spins oscillate faster than
-        # coprecessing spins
-        chiA_copr = splinterp_many(self.t_coorb, self.tds, chiA_copr_dyn.T).T
-        chiB_copr = splinterp_many(self.t_coorb, self.tds, chiB_copr_dyn.T).T
-        normalize_spin(chiA_copr, chiA_norm)
-        normalize_spin(chiB_copr, chiB_norm)
-        orbphase = _splinterp_Cwrapper(self.t_coorb, self.tds, orbphase_dyn)
-
-        quat = splinterp_many(self.t_coorb, self.tds, quat_dyn)
-        quat = quat/np.sqrt((quat*quat).sum(0))
-        chiA_coorb, chiB_coorb = coorb_spins_from_copr_spins(
-                chiA_copr, chiB_copr, orbphase)
-
-
-        # Evaluate coorbital waveform surrogate
-        h_coorb = self.coorb_sur(q, chiA_coorb, chiB_coorb, \
-                ellMax=ellMax)
-
         if timesM is not None:
             if timesM[-1] > self.t_coorb[-1] + 0.01:
                 raise Exception("'times' includes times larger than the"
@@ -1395,12 +1423,58 @@ Returns:
                 num_times = int(np.ceil((tf - t0)/dtM))
                 timesM = t0 + dtM*np.arange(num_times)
 
-        if do_interp:
-            h_inertial = self._rotate_coarse(
-                h_coorb, orbphase, quat, timesM, ellMax)
+        # Interpolate to the coorbital time grid, and transform to coorb frame.
+        # Interpolate first since coorbital spins oscillate faster than
+        # coprecessing spins
+        use_sparse = do_interp and hasattr(self, '_needed_t_idx')
+        if use_sparse:
+            t_needed = self.t_coorb[self._needed_t_idx]
+            chiA_copr = splinterp_many(t_needed, self.tds,
+                                       chiA_copr_dyn.T).T
+            chiB_copr = splinterp_many(t_needed, self.tds,
+                                       chiB_copr_dyn.T).T
+            normalize_spin(chiA_copr, chiA_norm)
+            normalize_spin(chiB_copr, chiB_norm)
+            orbphase = _splinterp_Cwrapper(t_needed, self.tds, orbphase_dyn)
+
+            t_coarse = self.t_coorb[self._coarse_rotation_idx]
+            quat = splinterp_many(t_coarse, self.tds, quat_dyn)
+            quat = quat / np.sqrt((quat * quat).sum(0))
+
+            chiA_coorb, chiB_coorb = coorb_spins_from_copr_spins(
+                chiA_copr, chiB_copr, orbphase)
+
+            h_coorb = self.coorb_sur(q, chiA_coorb, chiB_coorb,
+                                     ellMax=ellMax, coarse=True)
+
+            orbphase_coarse = orbphase[self._coarse_in_needed]
+            h_inertial = inertial_waveform_modes(
+                t_coarse, orbphase_coarse, quat, h_coorb)
+            h_inertial = self._interp_func(timesM, t_coarse, h_inertial)
         else:
-            h_inertial = inertial_waveform_modes(self.t_coorb, orbphase,
-                    quat, h_coorb)
+            chiA_copr = splinterp_many(self.t_coorb, self.tds,
+                                       chiA_copr_dyn.T).T
+            chiB_copr = splinterp_many(self.t_coorb, self.tds,
+                                       chiB_copr_dyn.T).T
+            normalize_spin(chiA_copr, chiA_norm)
+            normalize_spin(chiB_copr, chiB_norm)
+            orbphase = _splinterp_Cwrapper(self.t_coorb, self.tds,
+                                           orbphase_dyn)
+
+            quat = splinterp_many(self.t_coorb, self.tds, quat_dyn)
+            quat = quat / np.sqrt((quat * quat).sum(0))
+            chiA_coorb, chiB_coorb = coorb_spins_from_copr_spins(
+                chiA_copr, chiB_copr, orbphase)
+
+            h_coorb = self.coorb_sur(q, chiA_coorb, chiB_coorb,
+                                     ellMax=ellMax)
+
+            if do_interp:
+                h_inertial = self._rotate_coarse(
+                    h_coorb, orbphase, quat, timesM, ellMax)
+            else:
+                h_inertial = inertial_waveform_modes(self.t_coorb, orbphase,
+                        quat, h_coorb)
 
         # Make mode dict
         h = {}
