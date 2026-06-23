@@ -61,6 +61,7 @@ static PyMethodDef _utils_methods[] = {
     {"eval_fit", eval_fit, METH_VARARGS},
     {"eval_fit_batch", eval_fit_batch, METH_VARARGS},
     {"eval_fit_batch_dydt", eval_fit_batch_dydt, METH_VARARGS},
+    {"eval_fit_batch_dydt_framed", eval_fit_batch_dydt_framed, METH_VARARGS},
     {"normalize_y", normalize_y, METH_VARARGS},
     {"get_ds_fit_x", get_ds_fit_x, METH_VARARGS},
     {"assemble_dydt", assemble_dydt, METH_VARARGS},
@@ -521,6 +522,133 @@ static PyObject *eval_fit_batch_dydt(PyObject *self, PyObject *args) {
     dydt_data[8] = results[6]*cp - results[7]*sp;
     dydt_data[9] = results[6]*sp + results[7]*cp;
     dydt_data[10] = results[8];
+
+    return PyArray_Return(dydt);
+}
+
+
+/*
+ * Frame-aware fused eval_fit_batch + assemble_dydt.  Generalizes
+ * eval_fit_batch_dydt for surrogates (e.g. NRSur7dq4v3) whose fits do not all
+ * share one parameterization/frame:
+ *   - the omega_orb (ooxy), scalar omega, and chiA/chiB fits are each evaluated
+ *     with their own fit_params vector, and
+ *   - the coorbital->coprecessing rotation of the fit OUTPUTS is applied only
+ *     when the corresponding storage frame is 'coorb' (flag == 0); a 'copr'
+ *     storage frame (flag == 1) means the output is already coprecessing.
+ * The scalar omega fit has no storage frame (it is d(orbphase)/dt directly).
+ *
+ * Arguments:
+ *      fit_list:   Python list of 9 tuples (bf_orders, coefs), in batch order
+ *                  [ooxy0, ooxy1, omega, cAx, cAy, cAz, cBx, cBy, cBz]
+ *      fp_ooxy:    length-7 float numpy array, fit_params for the ooxy fits
+ *      fp_omega:   length-7 float numpy array, fit_params for the omega fit
+ *      fp_spin:    length-7 float numpy array, fit_params for the chiA/chiB fits
+ *      y:          length-11 float numpy array (quat, orbphase, chiA_copr, chiB_copr)
+ *      q_fit_offset, q_fit_slope: doubles for q rescaling
+ *      q_max_bfOrder, chi_max_bfOrder: ints for max basis function orders
+ *      ooxy_storage_copr: int; 1 => ooxy output already coprecessing (no rotation),
+ *                         0 => coorbital output (rotate coorb->copr)
+ *      spin_storage_copr: int; same semantics for the chiA/chiB outputs
+ *
+ * Returns a length-11 float numpy array dydt.
+ */
+static PyObject *eval_fit_batch_dydt_framed(PyObject *self, PyObject *args) {
+
+    PyObject *fit_list;
+    PyArrayObject *fp_ooxy, *fp_omega, *fp_spin, *y;
+    double q_fit_offset, q_fit_slope;
+    int q_max_bfOrder, chi_max_bfOrder;
+    int ooxy_storage_copr, spin_storage_copr;
+
+    if (!PyArg_ParseTuple(args, "OO!O!O!O!ddiiii",
+            &fit_list,
+            &PyArray_Type, &fp_ooxy,
+            &PyArray_Type, &fp_omega,
+            &PyArray_Type, &fp_spin,
+            &PyArray_Type, &y,
+            &q_fit_offset,
+            &q_fit_slope,
+            &q_max_bfOrder,
+            &chi_max_bfOrder,
+            &ooxy_storage_copr,
+            &spin_storage_copr)) return NULL;
+
+    double *y_data = (double *) PyArray_DATA(y);
+
+    /* One x_powers table per distinct parameter vector. */
+    int n_powers = q_max_bfOrder+1 + 6*(chi_max_bfOrder+1);
+    double xp_ooxy[n_powers], xp_omega[n_powers], xp_spin[n_powers];
+    compute_x_powers((double *) PyArray_DATA(fp_ooxy), q_fit_offset, q_fit_slope,
+                     q_max_bfOrder, chi_max_bfOrder, xp_ooxy);
+    compute_x_powers((double *) PyArray_DATA(fp_omega), q_fit_offset, q_fit_slope,
+                     q_max_bfOrder, chi_max_bfOrder, xp_omega);
+    compute_x_powers((double *) PyArray_DATA(fp_spin), q_fit_offset, q_fit_slope,
+                     q_max_bfOrder, chi_max_bfOrder, xp_spin);
+
+    /* Evaluate each fit with the x_powers table for its own parameter vector.
+       Batch order: [ooxy0, ooxy1, omega, cAx, cAy, cAz, cBx, cBy, cBz]. */
+    const double *tables[9] = {
+        xp_ooxy, xp_ooxy, xp_omega,
+        xp_spin, xp_spin, xp_spin,
+        xp_spin, xp_spin, xp_spin
+    };
+    double results[9];
+    int k;
+    for (k=0; k<9; k++) {
+        PyObject *fit_tuple = PyList_GET_ITEM(fit_list, k);
+        PyArrayObject *bf_orders = (PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 0);
+        PyArrayObject *coefs_arr = (PyArrayObject *) PyTuple_GET_ITEM(fit_tuple, 1);
+        long   *bf_order_data = (long *)   PyArray_DATA(bf_orders);
+        double *coef_data     = (double *) PyArray_DATA(coefs_arr);
+        int n = (int) PyArray_DIMS(coefs_arr)[0];
+        results[k] = eval_one_fit(bf_order_data, coef_data, n, tables[k],
+                                  q_max_bfOrder, chi_max_bfOrder);
+    }
+
+    npy_intp dims[1] = {11};
+    PyArrayObject *dydt = (PyArrayObject *) PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (!dydt) return NULL;
+    double *dydt_data = (double *) PyArray_DATA(dydt);
+
+    double cp = cos(y_data[4]);
+    double sp = sin(y_data[4]);
+
+    /* ooxy: rotate coorb->copr unless the fit output is already coprecessing. */
+    double ooxy_x, ooxy_y;
+    if (ooxy_storage_copr) {
+        ooxy_x = results[0];
+        ooxy_y = results[1];
+    } else {
+        ooxy_x = results[0]*cp - results[1]*sp;
+        ooxy_y = results[0]*sp + results[1]*cp;
+    }
+
+    /* Quaternion derivative from the coprecessing-frame ooxy. */
+    dydt_data[0] = (-0.5)*y_data[1]*ooxy_x - 0.5*y_data[2]*ooxy_y;
+    dydt_data[1] = (-0.5)*y_data[3]*ooxy_y + 0.5*y_data[0]*ooxy_x;
+    dydt_data[2] = 0.5*y_data[3]*ooxy_x + 0.5*y_data[0]*ooxy_y;
+    dydt_data[3] = 0.5*y_data[1]*ooxy_y - 0.5*y_data[2]*ooxy_x;
+
+    /* Orbital phase derivative (scalar omega; no frame rotation). */
+    dydt_data[4] = results[2];
+
+    /* Spin derivatives: rotate coorb->copr unless already coprecessing. */
+    if (spin_storage_copr) {
+        dydt_data[5] = results[3];
+        dydt_data[6] = results[4];
+        dydt_data[7] = results[5];
+        dydt_data[8] = results[6];
+        dydt_data[9] = results[7];
+        dydt_data[10] = results[8];
+    } else {
+        dydt_data[5] = results[3]*cp - results[4]*sp;
+        dydt_data[6] = results[3]*sp + results[4]*cp;
+        dydt_data[7] = results[5];
+        dydt_data[8] = results[6]*cp - results[7]*sp;
+        dydt_data[9] = results[6]*sp + results[7]*cp;
+        dydt_data[10] = results[8];
+    }
 
     return PyArray_Return(dydt);
 }

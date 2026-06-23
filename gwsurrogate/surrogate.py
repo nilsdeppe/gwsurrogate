@@ -2442,48 +2442,182 @@ See the __call__ method on how to evaluate waveforms.
         See NRHybSur3dq8 for an example.
         """
 
-        # needed to convert user input x to parameters used by surrogate fits
-        def get_fit_params(x):
-            """ Converts from x=[q, chi1x, chi1y, chi1z, chi2x, chi2y, chi2z]
-                to x = [np.log(q), chi1x, chi1y, chiHat, chi2x, chi2y, chi_a]
-                chiHat is defined in Eq.(3) of 1508.07253.
-                chi_a = (chi1 - chi2)/2.
-                Both chiHat and chi_a always lie in range [-1, 1].
-            """
+        # Check whether this h5 file was produced by pySurrogate's
+        # convert_to_gwsurrogate.py, which uses a different input
+        # parameterization from the original published NRSur7dq4 model.
+        with h5py.File(self.h5filename, 'r') as h5file:
+            _is_pysur = 'SurrogateMetadata' in h5file
 
-            x = np.copy(x)
+        # Per-fit frame flags written by pySurrogate's convert_to_gwsurrogate.py.
+        # Default to 'coorb' for all legacy h5 files (including the original
+        # published NRSur7dq4 model) that lack the SurrogateMetadata/Dynamics group
+        # or the per-fit datasets within it.
+        _ds_frames = {
+            'spin_deriv_storage_frame':    'coorb',
+            'spin_deriv_parameter_frame':  'coorb',
+            'omega_copr_storage_frame':    'coorb',
+            'omega_copr_parameter_frame':  'coorb',
+            'omega_coorb_parameter_frame': 'coorb',
+        }
+        if _is_pysur:
+            with h5py.File(self.h5filename, 'r') as h5file:
+                _meta_ds = h5file.get('SurrogateMetadata/Dynamics')
+                if _meta_ds is not None:
+                    for _key in list(_ds_frames):
+                        if _key in _meta_ds:
+                            _raw = _meta_ds[_key][()]
+                            _ds_frames[_key] = (
+                                _raw.decode() if isinstance(_raw, (bytes, np.bytes_))
+                                else str(_raw))
+                    for _key, _val in _ds_frames.items():
+                        if _val not in ('copr', 'coorb'):
+                            raise ValueError(
+                                "SurrogateMetadata/Dynamics/%s has unexpected "
+                                "value %r; expected 'copr' or 'coorb'."
+                                % (_key, _val))
 
-            q = float(x[0])
-            chi1z = float(x[3])
-            chi2z = float(x[6])
-            eta = q/(1.+q)**2
-            chi_wtAvg = (q*chi1z+chi2z)/(1+q)
-            chiHat = (chi_wtAvg - 38.*eta/113.*(chi1z + chi2z)) \
-                /(1. - 76.*eta/113.)
-            chi_a = (chi1z - chi2z)/2.
+        # omega may use a distinct spin parameterization (see below); None
+        # means it shares the default get_fit_params (legacy behavior).
+        get_fit_params_omega = None
 
-            x[0] = np.log(q)
-            x[3] = chiHat
-            x[6] = chi_a
+        if _is_pysur:
+            # Fits were trained by pySurrogate.  The per-fit spin
+            # parameterization is recorded in SurrogateMetadata as a
+            # machine-readable form key ('eff_chia' or 'sym_chi1z'); we build a
+            # matching get_fit_params for each so the reader cannot drift from
+            # the training-time fit_settings.  In current builds the coorbital
+            # waveform and most dynamics fits use 'eff_chia', while the scalar
+            # 'omega' dynamics fit uses 'sym_chi1z'.  q-scaling/bfOrder caps are
+            # identical across fits (uniform q_param) and read from
+            # CoorbitalWaveform.
 
-            return x
+            with h5py.File(self.h5filename, 'r') as h5file:
+                meta = h5file['SurrogateMetadata/CoorbitalWaveform']
+                _q_fit_offset    = float(meta['q_fit_offset'][()])
+                _q_fit_slope     = float(meta['q_fit_slope'][()])
+                _q_max_bfOrder   = int(meta['q_max_bfOrder'][()])
+                _chi_max_bfOrder = int(meta['chi_max_bfOrder'][()])
 
-        # needed to evaluate model-specific surrogate fits
-        def get_fit_settings():
-            """
-            These are to rescale the mass ratio fit range
-            from [-0.01, np.log(4+0.01)] to [-1, 1]. The chi fits are already
-            in this range.
+                def _read_form(group_path, key, default):
+                    grp = h5file.get(group_path)
+                    if grp is None or key not in grp:
+                        return default
+                    raw = grp[key][()]
+                    return (raw.decode() if isinstance(raw, (bytes, np.bytes_))
+                            else str(raw))
+
+                # Default spin form for the dynamics fits (and the coorbital
+                # waveform, which uses the same form).  Default to 'eff_chia'
+                # for builds predating the machine-readable form key.
+                _default_form = _read_form(
+                    'SurrogateMetadata/Dynamics', 'spin_param_form', 'eff_chia')
+                # Per-fit override for omega; falls back to the default form.
+                _omega_form = _read_form(
+                    'SurrogateMetadata/Dynamics', 'spin_param_form_omega',
+                    _default_form)
+
+                # The coorbital waveform shares the default get_fit_params, so
+                # its form must match the dynamics default.  Guard against a
+                # silent mismatch if a future build diverges them.
+                _coorb_form = _read_form(
+                    'SurrogateMetadata/CoorbitalWaveform', 'spin_param_form',
+                    _default_form)
+                if _coorb_form != _default_form:
+                    raise ValueError(
+                        "CoorbitalWaveform spin_param_form %r != Dynamics "
+                        "default %r; the reader assumes they share one "
+                        "get_fit_params." % (_coorb_form, _default_form))
+
+            def _make_get_fit_params(form):
+                """Build a get_fit_params closure for the given spin form key.
+                   Converts x=[q, chi1x, chi1y, chi1z, chi2x, chi2y, chi2z] to
+                   the 7-element fit-parameter vector used during training.  All
+                   forms share x[0]=log(q), x[2/5]=chi_a_{x,y}, x[3]=chiHat;
+                   they differ only in the in-plane combo (x[1], x[4]) and the
+                   7th coordinate (x[6]).  Matches fit_settings.get_fit_params.
+                """
+                if form not in ('eff_chia', 'sym_chi1z'):
+                    raise ValueError(
+                        "Unknown spin_param_form %r; expected 'eff_chia' or "
+                        "'sym_chi1z'." % form)
+
+                def get_fit_params(x):
+                    x = np.copy(x)
+                    q    = float(x[0])
+                    chi1x, chi1y, chi1z = float(x[1]), float(x[2]), float(x[3])
+                    chi2x, chi2y, chi2z = float(x[4]), float(x[5]), float(x[6])
+                    eta = q / (1. + q)**2
+                    chi_wtAvg = (q*chi1z + chi2z) / (1 + q)
+                    chiHat = (chi_wtAvg - 38.*eta/113.*(chi1z + chi2z)) \
+                        / (1. - 76.*eta/113.)
+                    x[0] = np.log(q)
+                    x[2] = (chi1x - chi2x) / 2.
+                    x[3] = chiHat
+                    x[5] = (chi1y - chi2y) / 2.
+                    if form == 'sym_chi1z':
+                        x[1] = (chi1x + chi2x) / 2.
+                        x[4] = (chi1y + chi2y) / 2.
+                        x[6] = chi1z
+                    else:   # 'eff_chia'
+                        x[1] = (q*chi1x + chi2x) / (1 + q)
+                        x[4] = (q*chi1y + chi2y) / (1 + q)
+                        x[6] = (chi1z - chi2z) / 2.
+                    return x
+
+                return get_fit_params
+
+            get_fit_params = _make_get_fit_params(_default_form)
+            if _omega_form != _default_form:
+                get_fit_params_omega = _make_get_fit_params(_omega_form)
+
+            def get_fit_settings():
+                return _q_fit_offset, _q_fit_slope, _q_max_bfOrder, _chi_max_bfOrder
+
+        else:
+            # Original published NRSur7dq4 parameterization.
+
+            # needed to convert user input x to parameters used by surrogate fits
+            def get_fit_params(x):
+                """ Converts from x=[q, chi1x, chi1y, chi1z, chi2x, chi2y, chi2z]
+                    to x = [np.log(q), chi1x, chi1y, chiHat, chi2x, chi2y, chi_a]
+                    chiHat is defined in Eq.(3) of 1508.07253.
+                    chi_a = (chi1 - chi2)/2.
+                    Both chiHat and chi_a always lie in range [-1, 1].
+                """
+
+                x = np.copy(x)
+
+                q = float(x[0])
+                chi1z = float(x[3])
+                chi2z = float(x[6])
+                eta = q/(1.+q)**2
+                chi_wtAvg = (q*chi1z+chi2z)/(1+q)
+                chiHat = (chi_wtAvg - 38.*eta/113.*(chi1z + chi2z)) \
+                    /(1. - 76.*eta/113.)
+                chi_a = (chi1z - chi2z)/2.
+
+                x[0] = np.log(q)
+                x[3] = chiHat
+                x[6] = chi_a
+
+                return x
+
+            # needed to evaluate model-specific surrogate fits
+            def get_fit_settings():
+                """
+                These are to rescale the mass ratio fit range
+                from [-0.01, np.log(4+0.01)] to [-1, 1]. The chi fits are already
+                in this range.
 
 
-            Values defined here are model-specific. These are for NRSur7dq4.
-            """
+                Values defined here are model-specific. These are for NRSur7dq4.
+                """
 
-            q_fit_offset = -0.9857019407834238
-            q_fit_slope = 1.4298059216576398
-            q_max_bfOrder = 3
-            chi_max_bfOrder = 2
-            return q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder
+                q_fit_offset = -0.9857019407834238
+                q_fit_slope = 1.4298059216576398
+                q_max_bfOrder = 3
+                chi_max_bfOrder = 2
+                return q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder
 
         # largest ell mode for NRSur7dq4
         ellMax = 4
@@ -2491,8 +2625,10 @@ See the __call__ method on how to evaluate waveforms.
         # max allowable reference dimensionless orbital angular frequency for NRSur7dq4
         omega_ref_max = 0.201
 
-        sur = precessing_surrogate.PrecessingSurrogate(self.h5filename,
-                 get_fit_params,get_fit_settings,ellMax,omega_ref_max)
+        sur = precessing_surrogate.PrecessingSurrogate(
+            self.h5filename, get_fit_params, get_fit_settings,
+            ellMax, omega_ref_max,
+            get_fit_params_omega=get_fit_params_omega, **_ds_frames)
         return sur
 
     def _get_intrinsic_parameters(self, q, chiA0, chiB0, precessing_opts,
@@ -2700,9 +2836,36 @@ further discussion on this point.
         # number of subdomains for SEOBNRv4PHMSur (should be maximum possible return of get_subdomain_ID + 1)
         num_subdomains = 14
 
-        sur = precessing_surrogate.PrecessingSurrogateMultiDomain(self.h5filename,
-              get_fit_params, get_fit_settings, ellMax, omega_ref_max,
-              get_subdomain_ID, num_subdomains)
+        # Per-fit frame flags — read from SurrogateMetadata/Dynamics if present,
+        # defaulting to 'coorb' for legacy h5 files.  See NRSur7dq4 reader for
+        # the analogous logic.
+        _ds_frames = {
+            'spin_deriv_storage_frame':    'coorb',
+            'spin_deriv_parameter_frame':  'coorb',
+            'omega_copr_storage_frame':    'coorb',
+            'omega_copr_parameter_frame':  'coorb',
+            'omega_coorb_parameter_frame': 'coorb',
+        }
+        with h5py.File(self.h5filename, 'r') as _h5:
+            _meta_ds = _h5.get('SurrogateMetadata/Dynamics')
+            if _meta_ds is not None:
+                for _key in list(_ds_frames):
+                    if _key in _meta_ds:
+                        _raw = _meta_ds[_key][()]
+                        _ds_frames[_key] = (
+                            _raw.decode() if isinstance(_raw, (bytes, np.bytes_))
+                            else str(_raw))
+                for _key, _val in _ds_frames.items():
+                    if _val not in ('copr', 'coorb'):
+                        raise ValueError(
+                            "SurrogateMetadata/Dynamics/%s has unexpected "
+                            "value %r; expected 'copr' or 'coorb'."
+                            % (_key, _val))
+
+        sur = precessing_surrogate.PrecessingSurrogateMultiDomain(
+            self.h5filename, get_fit_params, get_fit_settings,
+            ellMax, omega_ref_max, get_subdomain_ID, num_subdomains,
+            **_ds_frames)
         return sur
 
     def _get_intrinsic_parameters(self, q, chiA0, chiB0, precessing_opts,
@@ -2725,6 +2888,7 @@ SURROGATE_CLASSES = {
     "NRHybSur3dq8_CCE": NRHybSur3dq8_CCE,
     "NRHybSur2dq15": NRHybSur2dq15,
     "NRSur7dq4": NRSur7dq4,
+    "NRSur7dq4v3": NRSur7dq4,
     "NRHybSur3dq8Tidal": NRHybSur3dq8Tidal,
     "SEOBNRv4PHMSur": SEOBNRv4PHMSur,
 #    "SpEC_q1_10_NoSpin_nu5thDegPoly_exclude_2_0.h5":EvaluateSurrogate # model SpEC_q1_10_NoSpin

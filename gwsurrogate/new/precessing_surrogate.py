@@ -196,7 +196,13 @@ These time derivatives are given to the AB4 ODE solver.
     """
 
     def __init__(self, h5file, get_fit_params, get_fit_settings,
-                 omega_ref_max_model):
+                 omega_ref_max_model,
+                 spin_deriv_storage_frame='coorb',
+                 spin_deriv_parameter_frame='coorb',
+                 omega_copr_storage_frame='coorb',
+                 omega_copr_parameter_frame='coorb',
+                 omega_coorb_parameter_frame='coorb',
+                 get_fit_params_omega=None):
 
         """h5file is a h5py.File containing the surrogate data
 
@@ -207,10 +213,86 @@ These time derivatives are given to the AB4 ODE solver.
         model-specific surrogate fits.
 
         omega_ref_max_model is the maximium allowable reference dimensionless
-        orbital angular frequency supported by the surrogate model."""
+        orbital angular frequency supported by the surrogate model.
+
+        Frame flags — each accepts 'copr' or 'coorb'; default 'coorb' preserves
+        the original surrogate behavior and uses the fast C-kernel path.
+
+        spin_deriv_storage_frame:
+            Frame in which the chiA/chiB time-derivative fit *targets* are
+            expressed.  'copr': fit outputs are already in the coprecessing frame.
+            'coorb': fit outputs are coorbital-frame components and must be
+            rotated by -orbphase into the coprecessing frame before entering
+            the ODE state derivative.
+
+        spin_deriv_parameter_frame:
+            Frame of the spin inputs (x) to the chiA/chiB fits.
+            'copr': x built from (q, chiA_copr, chiB_copr).
+            'coorb': x built from (q, chiA_coorb, chiB_coorb).
+
+        omega_copr_storage_frame:
+            Frame in which the omega_copr (orbital angular-velocity vector x,y)
+            fit *target* is expressed.  Same 'copr'/'coorb' semantics as
+            spin_deriv_storage_frame, but for the omega_orb fit.
+
+        omega_copr_parameter_frame:
+            Frame of the spin inputs to the omega_copr (omega_orb) fit.
+            Same 'copr'/'coorb' semantics as spin_deriv_parameter_frame.
+
+        omega_coorb_parameter_frame:
+            Frame of the spin inputs to the scalar omega_coorb fit (the fit
+            that returns d(orbphase)/dt).  Its target is a scalar so there is
+            no storage-frame knob.
+        """
+        _valid = ('copr', 'coorb')
+        for flag_name, flag_val in [
+            ('spin_deriv_storage_frame',    spin_deriv_storage_frame),
+            ('spin_deriv_parameter_frame',  spin_deriv_parameter_frame),
+            ('omega_copr_storage_frame',    omega_copr_storage_frame),
+            ('omega_copr_parameter_frame',  omega_copr_parameter_frame),
+            ('omega_coorb_parameter_frame', omega_coorb_parameter_frame),
+        ]:
+            if flag_val not in _valid:
+                raise ValueError("%s must be 'copr' or 'coorb', got %r"
+                                 % (flag_name, flag_val))
+
+        self.spin_deriv_storage_frame    = spin_deriv_storage_frame
+        self.spin_deriv_parameter_frame  = spin_deriv_parameter_frame
+        self.omega_copr_storage_frame    = omega_copr_storage_frame
+        self.omega_copr_parameter_frame  = omega_copr_parameter_frame
+        self.omega_coorb_parameter_frame = omega_coorb_parameter_frame
+        # True when all flags are 'coorb' — enables the fast C-kernel path.
+        self._all_coorb = all(f == 'coorb' for f in [
+            spin_deriv_storage_frame, spin_deriv_parameter_frame,
+            omega_copr_storage_frame, omega_copr_parameter_frame,
+            omega_coorb_parameter_frame,
+        ])
+        # Precomputed frame selectors for the framed C kernel, so the hot ODE
+        # loop does no per-step string comparisons.  *_param_copr select which
+        # parameter vector each fit uses; *_storage_copr (ints) tell the C
+        # kernel whether the fit output is already coprecessing (1, no rotation)
+        # or coorbital (0, rotate coorb->copr).
+        self._ooxy_param_copr  = (omega_copr_parameter_frame  == 'copr')
+        self._spin_param_copr  = (spin_deriv_parameter_frame  == 'copr')
+        self._omega_param_copr = (omega_coorb_parameter_frame == 'copr')
+        self._ooxy_storage_copr = int(omega_copr_storage_frame == 'copr')
+        self._spin_storage_copr = int(spin_deriv_storage_frame == 'copr')
+
         self.t = h5file['t_ds'][()]
 
         self._get_fit_params = get_fit_params
+        # The scalar omega fit may use a different spin parameterization than
+        # the other fits (e.g. NRSur7dq4v3: omega uses 'sym_chi1z', the rest
+        # use 'eff_chia').  get_fit_params_omega=None means omega shares the
+        # default transform, which keeps the fast path bitwise-identical to the
+        # legacy single-parameterization behavior.
+        # NOTE: omega still shares get_fit_settings (q-scaling and bfOrder
+        # caps) with the other fits; a per-fit q_param/bfOrder for omega is not
+        # yet exported by convert_to_gwsurrogate.py.
+        self._get_fit_params_omega = (get_fit_params if get_fit_params_omega
+                                      is None else get_fit_params_omega)
+        self._omega_same_params = (
+            self._get_fit_params_omega is self._get_fit_params)
         self._get_fit_settings = get_fit_settings
         self._fit_settings = get_fit_settings()
         self.omega_ref_max_model = omega_ref_max_model
@@ -270,29 +352,73 @@ These time derivatives are given to the AB4 ODE solver.
 
 
 
+    def _build_x(self, y, q, frame):
+        """Build the fit parameter vector x for the given spin frame.
+
+        frame='coorb': x[1:7] holds (chiA, chiB) rotated to the coorbital
+            frame, identical to what _utils.get_ds_fit_x returns.
+        frame='copr': x[1:7] holds (chiA_copr, chiB_copr) taken directly
+            from the ODE state y[5:11] without any rotation.
+        """
+        if frame == 'coorb':
+            # Matches the C implementation in get_ds_fit_x exactly.
+            return _utils.get_ds_fit_x(y, q)
+        # copr: just take spins from y without rotating.
+        raw = np.empty(7)
+        raw[0] = q
+        raw[1:4] = y[5:8]    # chiA_copr
+        raw[4:7] = y[8:11]   # chiB_copr
+        return self._get_fit_params(raw)
+
+    def _x_coorb(self, y, q):
+        return _utils.get_ds_fit_x(y, q)
+
     def get_time_deriv_from_index(self, i0, q, y):
-        # Setup fit variables
-        x = _utils.get_ds_fit_x(y, q)
-        fit_params = self._get_fit_params(x)
+        data = self.fit_data[i0]
+        q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder \
+            = self._fit_settings
 
-        # Reference implementation for the fused C path below:
-        #
-        # data = self.fit_data[i0]
-        # ooxy_coorb = _eval_vector_fit(data['omega_orb'], 2, fit_params, self._fit_settings)
-        # omega = _eval_scalar_fit(data['omega'], fit_params, self._fit_settings)
-        # cAdot_coorb = _eval_vector_fit(data['chiA'], 3, fit_params, self._fit_settings)
-        # cBdot_coorb = _eval_vector_fit(data['chiB'], 3, fit_params, self._fit_settings)
-        # dydt = _utils.assemble_dydt(
-        #     y, ooxy_coorb, omega, cAdot_coorb, cBdot_coorb
-        # )
+        if self._all_coorb and self._omega_same_params:
+            # Fast path — all frame flags are 'coorb' and omega shares the
+            # default spin parameterization.  Fused C call: evaluate 9 fits +
+            # assemble dydt in one call.  Bitwise/perf identical to upstream.
+            x = _utils.get_ds_fit_x(y, q)
+            fit_params = self._get_fit_params(x)
+            return _utils.eval_fit_batch_dydt(
+                self.fit_data_batch[i0], fit_params, y,
+                q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder)
 
-        # Fused: evaluate 9 fits + assemble dydt in one C call
-        q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder = self._fit_settings
-        dydt = _utils.eval_fit_batch_dydt(
-            self.fit_data_batch[i0], fit_params, y,
-            q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder)
+        # Tier 2 — any non-legacy case: non-coorb frame flags and/or omega
+        # using a distinct spin parameterization.  Build the (<=3) parameter
+        # vectors in Python (get_fit_params is a metadata-driven callback that
+        # can't move to C), then evaluate all 9 fits, apply the per-group frame
+        # rotations, and assemble dydt in ONE framed C call.  This replaces both
+        # the old per-fit "middle" path and the Python slow path, so the hot
+        # ODE loop no longer does Python-side rotations/assembly.
+        x_coorb = _utils.get_ds_fit_x(y, q)
+        fp_coorb = self._get_fit_params(x_coorb)
+        if self._ooxy_param_copr or self._spin_param_copr or self._omega_param_copr:
+            raw_copr = np.empty(7)
+            raw_copr[0] = q
+            raw_copr[1:4] = y[5:8]
+            raw_copr[4:7] = y[8:11]
+            fp_copr = self._get_fit_params(raw_copr)
+        else:
+            raw_copr = None
+            fp_copr = None
 
-        return dydt
+        fp_ooxy = fp_copr if self._ooxy_param_copr else fp_coorb
+        fp_spin = fp_copr if self._spin_param_copr else fp_coorb
+        if self._omega_same_params:
+            fp_omega = fp_copr if self._omega_param_copr else fp_coorb
+        else:
+            raw_omega = raw_copr if self._omega_param_copr else x_coorb
+            fp_omega = self._get_fit_params_omega(raw_omega)
+
+        return _utils.eval_fit_batch_dydt_framed(
+            self.fit_data_batch[i0], fp_ooxy, fp_omega, fp_spin, y,
+            q_fit_offset, q_fit_slope, q_max_bfOrder, chi_max_bfOrder,
+            self._ooxy_storage_copr, self._spin_storage_copr)
 
     def get_time_deriv(self, t, q, y):
         """
@@ -318,8 +444,17 @@ cubic interpolation. Use get_time_deriv_from_index when possible.
         return dydt
 
     def get_omega(self, i0, q, y):
-        x = _utils.get_ds_fit_x(y, q)
-        fit_params = self._get_fit_params(x)
+        if self.omega_coorb_parameter_frame == 'coorb':
+            x = _utils.get_ds_fit_x(y, q)
+        else:
+            # copr: use coprecessing spins directly without rotating.
+            raw = np.empty(7)
+            raw[0] = q
+            raw[1:4] = y[5:8]
+            raw[4:7] = y[8:11]
+            x = raw
+        # Use omega's own spin parameterization (may differ from the default).
+        fit_params = self._get_fit_params_omega(x)
         omega = _eval_scalar_fit(self.fit_data[i0]['omega'], fit_params, self._fit_settings)
         return omega
 
@@ -862,7 +997,13 @@ See the __call__ method on how to evaluate waveforms.
     """
 
     def __init__(self, filename, get_fit_params, get_fit_settings,
-                 ellMax_model,omega_ref_max_model):
+                 ellMax_model, omega_ref_max_model,
+                 spin_deriv_storage_frame='coorb',
+                 spin_deriv_parameter_frame='coorb',
+                 omega_copr_storage_frame='coorb',
+                 omega_copr_parameter_frame='coorb',
+                 omega_coorb_parameter_frame='coorb',
+                 get_fit_params_omega=None):
         """
 Loads the surrogate model data.
 
@@ -874,6 +1015,16 @@ get_fit_settings: A function that provides information about
 ellMax_model: The maximum ell mode supported by the surrogate model
 omega_ref_max_model: The maximium allowable reference dimensionless
                      orbital angular frequency supported by the surrogate model
+
+Frame flags: see DynamicsSurrogate.__init__ for full documentation.
+All default to 'coorb' to preserve legacy evaluation behavior.
+
+get_fit_params_omega: Optional separate get_fit_params for the scalar omega
+                      fit, when it uses a different spin parameterization than
+                      the other dynamics fits.  None means omega shares
+                      get_fit_params (legacy behavior).  Only the dynamics
+                      surrogate uses it; the coorbital waveform surrogate keeps
+                      get_fit_params.
         """
         if isinstance(filename, h5py._hl.group.Group) or isinstance(filename, h5py._hl.files.File):
             h5file = filename
@@ -882,7 +1033,15 @@ omega_ref_max_model: The maximium allowable reference dimensionless
 
         self.ellMax_model = ellMax_model
         self.omega_ref_max_model = omega_ref_max_model
-        self.dynamics_sur = DynamicsSurrogate(h5file,get_fit_params,get_fit_settings,omega_ref_max_model)
+        self.dynamics_sur = DynamicsSurrogate(
+            h5file, get_fit_params, get_fit_settings, omega_ref_max_model,
+            spin_deriv_storage_frame=spin_deriv_storage_frame,
+            spin_deriv_parameter_frame=spin_deriv_parameter_frame,
+            omega_copr_storage_frame=omega_copr_storage_frame,
+            omega_copr_parameter_frame=omega_copr_parameter_frame,
+            omega_coorb_parameter_frame=omega_coorb_parameter_frame,
+            get_fit_params_omega=get_fit_params_omega,
+        )
         self.coorb_sur = CoorbitalWaveformSurrogate(h5file,get_fit_params,get_fit_settings)
         self.t_coorb = self.coorb_sur.t
         self.tds = np.append(self.dynamics_sur.t[0:6:2], \
@@ -1148,8 +1307,14 @@ See the __call__ method on how to evaluate waveforms.
     """
 
     def __init__(self, filename, get_fit_params, get_fit_settings,
-                 ellMax_model,omega_ref_max_model, get_subdomain_ID,
-                 num_subdomains):
+                 ellMax_model, omega_ref_max_model, get_subdomain_ID,
+                 num_subdomains,
+                 spin_deriv_storage_frame='coorb',
+                 spin_deriv_parameter_frame='coorb',
+                 omega_copr_storage_frame='coorb',
+                 omega_copr_parameter_frame='coorb',
+                 omega_coorb_parameter_frame='coorb',
+                 get_fit_params_omega=None):
         """Loads the surrogate model data.
 
 filename: The hdf5 file containing the surrogate data.
@@ -1163,6 +1328,13 @@ omega_ref_max_model: The maximium allowable reference dimensionless
 get_subdomain_ID: A function that takes the evaluation point (q, chiA0, chiB0) and returns
                   the surrogate's subdomain ID number.
 num_subdomains: The total number of subdomains in the surrogate model.
+
+Frame flags: see DynamicsSurrogate.__init__ for full documentation.
+All default to 'coorb' to preserve legacy evaluation behavior.
+The same flags are applied uniformly across all subdomains.
+
+get_fit_params_omega: see PrecessingSurrogate.__init__.  Applied uniformly
+                      across all subdomains.
         """
 
         self.precessing_sur_dict = {}
@@ -1182,7 +1354,16 @@ num_subdomains: The total number of subdomains in the surrogate model.
         for case_id, k in enumerate(h5fl.keys()):
             domain_name = 'dom_{}'.format(case_id)
             h5file = h5fl[domain_name]
-            self.precessing_sur_dict[case_id] = PrecessingSurrogate(h5file,get_fit_params,self._get_fit_settings_list[case_id],ellMax_model,omega_ref_max_model)
+            self.precessing_sur_dict[case_id] = PrecessingSurrogate(
+                h5file, get_fit_params, self._get_fit_settings_list[case_id],
+                ellMax_model, omega_ref_max_model,
+                spin_deriv_storage_frame=spin_deriv_storage_frame,
+                spin_deriv_parameter_frame=spin_deriv_parameter_frame,
+                omega_copr_storage_frame=omega_copr_storage_frame,
+                omega_copr_parameter_frame=omega_copr_parameter_frame,
+                omega_coorb_parameter_frame=omega_coorb_parameter_frame,
+                get_fit_params_omega=get_fit_params_omega,
+            )
 
         self.mode_list = self.precessing_sur_dict[0].coorb_sur.mode_list
 
